@@ -1,0 +1,344 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+aimd_post.py - AIMD 热力学数据后处理
+
+从 OSZICAR 或 OUTCAR 提取每个离子步的热力学数据：
+- 时间步索引 (step)
+- 总能量 E0 (eV)
+- 温度 T (K)
+- 自由能 F (eV)
+
+用法:
+    python3 aimd_post.py [--oszicar OSZICAR] [--outcar OUTCAR] [--output aimd_thermo.csv]
+
+输出:
+    - aimd_thermo.csv: 热力学数据 CSV 文件
+    - 终端摘要: 最后 5 行数据
+
+依赖:
+    - 标准库 (无需额外安装)
+    - numpy (可选，用于统计计算)
+
+作者: STAR0418-ABC
+"""
+
+import argparse
+import sys
+import os
+import re
+from typing import List, Dict, Optional, Tuple
+
+
+def parse_oszicar(filepath: str) -> List[Dict]:
+    """
+    解析 OSZICAR 文件，提取每个离子步的 E0、F、T
+
+    OSZICAR 格式示例:
+        1 F= -.12345678E+03 E0= -.12345678E+03  d E =-.123456E+00
+        或 AIMD 格式:
+        1 T=   300.00 E= -.12345678E+03 F= -.12345678E+03 E0= -.12345678E+03
+
+    返回:
+        数据列表，每项包含 step, E0, T, F
+    """
+    if not os.path.isfile(filepath):
+        return []
+
+    data = []
+
+    # 正则表达式匹配离子步行
+    # 格式1 (静态/弛豫): "   1 F= -.12345E+03 E0= ..."
+    # 格式2 (AIMD): "   1 T=   300.00 E= ... F= ... E0= ..."
+    pattern_aimd = re.compile(
+        r'^\s*(\d+)\s+T=\s*([\d.E+-]+)\s+E=\s*([\d.E+-]+)\s+F=\s*([\d.E+-]+)\s+E0=\s*([\d.E+-]+)',
+        re.IGNORECASE
+    )
+    pattern_static = re.compile(
+        r'^\s*(\d+)\s+F=\s*([\d.E+-]+)\s+E0=\s*([\d.E+-]+)',
+        re.IGNORECASE
+    )
+
+    with open(filepath, 'r') as f:
+        for line in f:
+            # 尝试 AIMD 格式
+            m = pattern_aimd.match(line)
+            if m:
+                step = int(m.group(1))
+                T = float(m.group(2))
+                E = float(m.group(3))
+                F = float(m.group(4))
+                E0 = float(m.group(5))
+                data.append({
+                    'step': step,
+                    'E0': E0,
+                    'T': T,
+                    'F': F
+                })
+                continue
+
+            # 尝试静态/弛豫格式
+            m = pattern_static.match(line)
+            if m:
+                step = int(m.group(1))
+                F = float(m.group(2))
+                E0 = float(m.group(3))
+                data.append({
+                    'step': step,
+                    'E0': E0,
+                    'T': None,
+                    'F': F
+                })
+
+    return data
+
+
+def parse_outcar_thermo(filepath: str) -> List[Dict]:
+    """
+    从 OUTCAR 解析温度和能量数据（作为 OSZICAR 的补充或替代）
+
+    提取:
+    - "free  energy   TOTEN  =" 行的能量
+    - "kin. lattice  EKIN_LAT=" 行的温度 (AIMD)
+    - 或 "kinetic energy EKIN   =" 行
+
+    返回:
+        数据列表
+    """
+    if not os.path.isfile(filepath):
+        return []
+
+    data = []
+    step = 0
+    current_E0 = None
+    current_T = None
+    current_F = None
+
+    # 正则表达式
+    pattern_toten = re.compile(r'free\s+energy\s+TOTEN\s*=\s*([\d.E+-]+)', re.IGNORECASE)
+    pattern_temp = re.compile(r'temperature\s+([\d.E+-]+)\s*K', re.IGNORECASE)
+    pattern_ekin_lat = re.compile(r'EKIN_LAT=\s*([\d.E+-]+)\s+\(temperature\s+([\d.E+-]+)\s*K\)', re.IGNORECASE)
+    pattern_f = re.compile(r'free\s+energy\s+TOTEN\s*=\s*([\d.E+-]+)', re.IGNORECASE)
+    pattern_e0 = re.compile(r'energy\s+without\s+entropy\s*=\s*([\d.E+-]+)', re.IGNORECASE)
+    pattern_ionic_step = re.compile(r'---+\s*Iteration\s+(\d+)\s*\(\s*(\d+)\s*\)', re.IGNORECASE)
+
+    with open(filepath, 'r') as f:
+        for line in f:
+            # 检测离子步迭代
+            m = pattern_ionic_step.search(line)
+            if m:
+                # 保存上一步数据
+                if step > 0 and current_E0 is not None:
+                    data.append({
+                        'step': step,
+                        'E0': current_E0,
+                        'T': current_T,
+                        'F': current_F
+                    })
+                step = int(m.group(1))
+                current_E0 = None
+                current_T = None
+                current_F = None
+                continue
+
+            # TOTEN (作为 F)
+            m = pattern_toten.search(line)
+            if m:
+                current_F = float(m.group(1))
+
+            # E0 (energy without entropy)
+            m = pattern_e0.search(line)
+            if m:
+                current_E0 = float(m.group(1))
+
+            # 温度 (AIMD)
+            m = pattern_ekin_lat.search(line)
+            if m:
+                current_T = float(m.group(2))
+            else:
+                m = pattern_temp.search(line)
+                if m:
+                    current_T = float(m.group(1))
+
+    # 保存最后一步
+    if step > 0 and current_E0 is not None:
+        data.append({
+            'step': step,
+            'E0': current_E0,
+            'T': current_T,
+            'F': current_F
+        })
+
+    return data
+
+
+def merge_data(oszicar_data: List[Dict], outcar_data: List[Dict]) -> List[Dict]:
+    """
+    合并 OSZICAR 和 OUTCAR 数据，优先使用 OSZICAR
+
+    如果 OSZICAR 缺少温度信息，尝试从 OUTCAR 补充
+    """
+    if not oszicar_data:
+        return outcar_data
+
+    if not outcar_data:
+        return oszicar_data
+
+    # 以 OSZICAR 为主，从 OUTCAR 补充缺失的温度
+    outcar_dict = {d['step']: d for d in outcar_data}
+
+    merged = []
+    for d in oszicar_data:
+        step = d['step']
+        result = d.copy()
+
+        # 如果 OSZICAR 缺少温度，从 OUTCAR 补充
+        if result['T'] is None and step in outcar_dict:
+            result['T'] = outcar_dict[step].get('T')
+
+        merged.append(result)
+
+    return merged
+
+
+def write_csv(data: List[Dict], filepath: str):
+    """
+    写入 CSV 文件
+    """
+    with open(filepath, 'w') as f:
+        # 表头
+        f.write("step,E0_eV,T_K,F_eV\n")
+
+        for d in data:
+            step = d['step']
+            E0 = f"{d['E0']:.8f}" if d['E0'] is not None else ""
+            T = f"{d['T']:.2f}" if d['T'] is not None else ""
+            F = f"{d['F']:.8f}" if d['F'] is not None else ""
+            f.write(f"{step},{E0},{T},{F}\n")
+
+
+def print_summary(data: List[Dict], n_lines: int = 5):
+    """
+    打印最后 N 行摘要
+    """
+    print("\n" + "=" * 70)
+    print(f"最后 {n_lines} 步数据摘要:")
+    print("=" * 70)
+    print(f"{'Step':>8}  {'E0 (eV)':>16}  {'T (K)':>10}  {'F (eV)':>16}")
+    print("-" * 70)
+
+    for d in data[-n_lines:]:
+        step = d['step']
+        E0 = f"{d['E0']:.6f}" if d['E0'] is not None else "N/A"
+        T = f"{d['T']:.2f}" if d['T'] is not None else "N/A"
+        F = f"{d['F']:.6f}" if d['F'] is not None else "N/A"
+        print(f"{step:>8}  {E0:>16}  {T:>10}  {F:>16}")
+
+    print("=" * 70)
+
+    # 统计信息
+    if len(data) > 0:
+        print(f"\n总步数: {len(data)}")
+
+        # 温度统计
+        temps = [d['T'] for d in data if d['T'] is not None]
+        if temps:
+            T_avg = sum(temps) / len(temps)
+            T_min = min(temps)
+            T_max = max(temps)
+            print(f"温度: 平均 {T_avg:.1f} K, 范围 [{T_min:.1f}, {T_max:.1f}] K")
+
+        # 能量统计
+        energies = [d['E0'] for d in data if d['E0'] is not None]
+        if energies:
+            E_avg = sum(energies) / len(energies)
+            E_min = min(energies)
+            E_max = max(energies)
+            print(f"E0: 平均 {E_avg:.4f} eV, 范围 [{E_min:.4f}, {E_max:.4f}] eV")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="AIMD 热力学数据后处理",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+示例:
+    python3 aimd_post.py
+    python3 aimd_post.py --oszicar OSZICAR --outcar OUTCAR
+    python3 aimd_post.py --output my_thermo.csv
+        """
+    )
+    parser.add_argument("--oszicar", default="OSZICAR",
+                        help="OSZICAR 文件路径 (默认: OSZICAR)")
+    parser.add_argument("--outcar", default="OUTCAR",
+                        help="OUTCAR 文件路径 (默认: OUTCAR)")
+    parser.add_argument("--output", default="aimd_thermo.csv",
+                        help="输出 CSV 文件名 (默认: aimd_thermo.csv)")
+
+    args = parser.parse_args()
+
+    print("=" * 70)
+    print("aimd_post.py - AIMD 热力学数据后处理")
+    print("=" * 70)
+    print(f"OSZICAR: {args.oszicar}")
+    print(f"OUTCAR: {args.outcar}")
+    print(f"输出文件: {args.output}")
+    print("=" * 70)
+
+    # 检查文件存在
+    oszicar_exists = os.path.isfile(args.oszicar)
+    outcar_exists = os.path.isfile(args.outcar)
+
+    if not oszicar_exists and not outcar_exists:
+        print(f"[ERROR] OSZICAR 和 OUTCAR 都不存在")
+        sys.exit(1)
+
+    # 解析数据
+    print("\n>>> 解析数据...")
+
+    oszicar_data = []
+    outcar_data = []
+
+    if oszicar_exists:
+        print(f"    读取 OSZICAR...")
+        oszicar_data = parse_oszicar(args.oszicar)
+        print(f"    从 OSZICAR 读取 {len(oszicar_data)} 个离子步")
+
+    if outcar_exists:
+        print(f"    读取 OUTCAR...")
+        outcar_data = parse_outcar_thermo(args.outcar)
+        print(f"    从 OUTCAR 读取 {len(outcar_data)} 个离子步")
+
+    # 合并数据
+    data = merge_data(oszicar_data, outcar_data)
+
+    if len(data) == 0:
+        print("[ERROR] 未能解析到任何热力学数据")
+        sys.exit(1)
+
+    print(f"\n>>> 合并后共 {len(data)} 个数据点")
+
+    # 检查数据完整性
+    n_with_T = sum(1 for d in data if d['T'] is not None)
+    n_with_E0 = sum(1 for d in data if d['E0'] is not None)
+    n_with_F = sum(1 for d in data if d['F'] is not None)
+
+    print(f"    有 E0 数据: {n_with_E0}/{len(data)}")
+    print(f"    有 T 数据: {n_with_T}/{len(data)}")
+    print(f"    有 F 数据: {n_with_F}/{len(data)}")
+
+    if n_with_T == 0:
+        print("    [INFO] 无温度数据，可能是静态计算或结构优化")
+
+    # 保存 CSV
+    print(f"\n>>> 保存到 {args.output}...")
+    write_csv(data, args.output)
+    print(f"[OK] 已保存 {len(data)} 行数据到 {args.output}")
+
+    # 打印摘要
+    print_summary(data, n_lines=5)
+
+
+if __name__ == "__main__":
+    main()
+
