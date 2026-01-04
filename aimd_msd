@@ -1,0 +1,330 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+aimd_msd.py - 从 XDATCAR 计算均方位移 (MSD) 并拟合扩散系数
+
+用法:
+    python3 aimd_msd.py --specie Li --dt_fs 1.0 [--xdatcar XDATCAR] [--skip 0] [--fit_start 0.5]
+
+输出:
+    - msd_<specie>.csv: 时间 (ps) vs MSD (Å²)
+    - 终端摘要: 帧数、MSD 末值、扩散系数 D
+
+依赖:
+    - numpy (pip install numpy)
+
+原理:
+    1. 读取 XDATCAR 中的分数坐标轨迹
+    2. 使用 fractional unwrapping (d -= round(d)) 处理周期性边界
+    3. 转换为笛卡尔坐标，计算选定物种原子的 MSD(t)
+    4. 对末端区间 (fit_start ~ 1.0) 线性拟合，D = slope / 6
+    5. 单位换算: 1 Å²/ps = 1e-4 cm²/s
+
+作者: STAR0418-ABC
+"""
+
+import argparse
+import sys
+import os
+from typing import List, Tuple, Optional
+
+try:
+    import numpy as np
+except ImportError:
+    print("[ERROR] 需要 numpy 库，请运行: pip install numpy")
+    sys.exit(1)
+
+
+def parse_xdatcar(filepath: str) -> Tuple[np.ndarray, List[str], List[int], List[np.ndarray]]:
+    """
+    解析 XDATCAR 文件
+
+    返回:
+        lattice: (3, 3) 晶格矢量矩阵
+        species: 元素符号列表
+        counts: 每种元素原子数
+        frames: 帧列表，每帧为 (natoms, 3) 分数坐标数组
+    """
+    if not os.path.isfile(filepath):
+        print(f"[ERROR] 文件不存在: {filepath}")
+        sys.exit(1)
+
+    with open(filepath, 'r') as f:
+        lines = f.readlines()
+
+    if len(lines) < 8:
+        print(f"[ERROR] XDATCAR 文件格式错误或为空: {filepath}")
+        sys.exit(1)
+
+    # 第 1 行: 注释
+    # 第 2 行: 缩放因子
+    scale = float(lines[1].strip())
+
+    # 第 3-5 行: 晶格矢量
+    lattice = np.zeros((3, 3))
+    for i in range(3):
+        lattice[i] = [float(x) for x in lines[2 + i].split()]
+    lattice *= scale
+
+    # 第 6 行: 元素符号
+    species = lines[5].split()
+
+    # 第 7 行: 每种元素原子数
+    counts = [int(x) for x in lines[6].split()]
+    natoms = sum(counts)
+
+    # 解析帧
+    frames = []
+    idx = 7
+
+    while idx < len(lines):
+        line = lines[idx].strip()
+        # 跳过帧头（如 "Direct configuration= 1"）
+        if line.startswith("Direct") or line.startswith("direct") or "configuration" in line.lower():
+            idx += 1
+            continue
+
+        # 读取一帧坐标
+        if idx + natoms > len(lines):
+            break
+
+        frame = np.zeros((natoms, 3))
+        valid_frame = True
+        for i in range(natoms):
+            try:
+                coords = lines[idx + i].split()[:3]
+                frame[i] = [float(c) for c in coords]
+            except (ValueError, IndexError):
+                valid_frame = False
+                break
+
+        if valid_frame:
+            frames.append(frame)
+            idx += natoms
+        else:
+            idx += 1
+
+    if len(frames) == 0:
+        print(f"[ERROR] 未能从 XDATCAR 读取任何帧")
+        sys.exit(1)
+
+    return lattice, species, counts, frames
+
+
+def get_species_indices(species: List[str], counts: List[int], target: str) -> np.ndarray:
+    """
+    获取目标物种的原子索引
+
+    返回:
+        indices: 目标物种原子的索引数组
+    """
+    indices = []
+    offset = 0
+    found = False
+
+    for sp, cnt in zip(species, counts):
+        if sp == target:
+            indices.extend(range(offset, offset + cnt))
+            found = True
+        offset += cnt
+
+    if not found:
+        print(f"[ERROR] 未找到物种: {target}")
+        print(f"[INFO] 可用物种: {species}")
+        sys.exit(1)
+
+    return np.array(indices)
+
+
+def unwrap_trajectory(frames: List[np.ndarray]) -> np.ndarray:
+    """
+    分数坐标 unwrapping，处理周期性边界条件
+
+    使用 d -= round(d) 方法消除周期性跳跃
+
+    返回:
+        unwrapped: (nframes, natoms, 3) unwrapped 分数坐标
+    """
+    nframes = len(frames)
+    natoms = frames[0].shape[0]
+
+    unwrapped = np.zeros((nframes, natoms, 3))
+    unwrapped[0] = frames[0].copy()
+
+    for t in range(1, nframes):
+        # 计算位移
+        d = frames[t] - frames[t - 1]
+        # 周期性校正: 如果位移 > 0.5，说明穿越了边界
+        d -= np.round(d)
+        # 累积位移
+        unwrapped[t] = unwrapped[t - 1] + d
+
+    return unwrapped
+
+
+def compute_msd(unwrapped: np.ndarray, lattice: np.ndarray, indices: np.ndarray) -> np.ndarray:
+    """
+    计算选定原子的均方位移 MSD(t)
+
+    参数:
+        unwrapped: (nframes, natoms, 3) unwrapped 分数坐标
+        lattice: (3, 3) 晶格矢量
+        indices: 目标原子索引
+
+    返回:
+        msd: (nframes,) 每帧的平均 MSD (Å²)
+    """
+    nframes = unwrapped.shape[0]
+
+    # 提取目标原子轨迹
+    traj = unwrapped[:, indices, :]  # (nframes, nselected, 3)
+
+    # 转换为笛卡尔坐标
+    cart = np.tensordot(traj, lattice, axes=([2], [0]))  # (nframes, nselected, 3)
+
+    # 计算相对于初始位置的位移
+    disp = cart - cart[0]  # (nframes, nselected, 3)
+
+    # 计算 MSD: 对每个原子求 |r(t) - r(0)|²，然后对原子平均
+    msd = np.mean(np.sum(disp ** 2, axis=2), axis=1)  # (nframes,)
+
+    return msd
+
+
+def linear_fit(x: np.ndarray, y: np.ndarray) -> Tuple[float, float]:
+    """
+    线性最小二乘拟合 y = a + b*x
+
+    返回:
+        intercept, slope
+    """
+    n = len(x)
+    sx = np.sum(x)
+    sy = np.sum(y)
+    sxx = np.sum(x * x)
+    sxy = np.sum(x * y)
+
+    denom = n * sxx - sx * sx
+    if abs(denom) < 1e-15:
+        return 0.0, 0.0
+
+    slope = (n * sxy - sx * sy) / denom
+    intercept = (sy - slope * sx) / n
+
+    return intercept, slope
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="从 XDATCAR 计算 MSD 并拟合扩散系数",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+示例:
+    python3 aimd_msd.py --specie Li --dt_fs 1.0
+    python3 aimd_msd.py --specie Li --dt_fs 2.0 --skip 500 --fit_start 0.6
+        """
+    )
+    parser.add_argument("--xdatcar", default="XDATCAR",
+                        help="XDATCAR 文件路径 (默认: XDATCAR)")
+    parser.add_argument("--specie", required=True,
+                        help="目标物种符号，如 Li/Zn/K/Al")
+    parser.add_argument("--dt_fs", type=float, required=True,
+                        help="时间步长 POTIM (fs)")
+    parser.add_argument("--skip", type=int, default=0,
+                        help="跳过前 N 帧 (默认: 0)")
+    parser.add_argument("--fit_start", type=float, default=0.5,
+                        help="线性拟合起始位置 (0~1 的比例，默认: 0.5)")
+
+    args = parser.parse_args()
+
+    print("=" * 60)
+    print("aimd_msd.py - MSD 计算与扩散系数拟合")
+    print("=" * 60)
+    print(f"XDATCAR: {args.xdatcar}")
+    print(f"物种: {args.specie}")
+    print(f"dt: {args.dt_fs} fs")
+    print(f"跳过帧数: {args.skip}")
+    print(f"拟合起始: {args.fit_start:.1%}")
+    print("=" * 60)
+
+    # 1. 读取 XDATCAR
+    print("\n>>> 读取 XDATCAR...")
+    lattice, species, counts, frames = parse_xdatcar(args.xdatcar)
+    print(f"    晶格矢量:\n{lattice}")
+    print(f"    物种: {species}")
+    print(f"    原子数: {counts} (总计 {sum(counts)})")
+    print(f"    总帧数: {len(frames)}")
+
+    # 2. 跳过初始帧
+    if args.skip >= len(frames):
+        print(f"[ERROR] skip ({args.skip}) >= 总帧数 ({len(frames)})")
+        sys.exit(1)
+
+    frames = frames[args.skip:]
+    nframes = len(frames)
+    print(f"    有效帧数: {nframes} (跳过 {args.skip})")
+
+    # 3. 获取目标物种索引
+    print(f"\n>>> 查找物种 {args.specie}...")
+    indices = get_species_indices(species, counts, args.specie)
+    print(f"    找到 {len(indices)} 个 {args.specie} 原子")
+
+    # 4. Unwrap 轨迹
+    print("\n>>> Unwrapping 轨迹...")
+    unwrapped = unwrap_trajectory(frames)
+
+    # 5. 计算 MSD
+    print(">>> 计算 MSD...")
+    msd = compute_msd(unwrapped, lattice, indices)
+
+    # 6. 生成时间轴 (ps)
+    dt_ps = args.dt_fs / 1000.0  # fs -> ps
+    t_ps = np.arange(nframes) * dt_ps
+
+    # 7. 保存 CSV
+    outfile = f"msd_{args.specie}.csv"
+    print(f"\n>>> 保存结果到 {outfile}...")
+    with open(outfile, 'w') as f:
+        f.write("t_ps,msd_A2\n")
+        for t, m in zip(t_ps, msd):
+            f.write(f"{t:.6f},{m:.6f}\n")
+
+    # 8. 线性拟合扩散系数
+    print("\n>>> 线性拟合扩散系数...")
+    fit_start_idx = int(nframes * args.fit_start)
+    if fit_start_idx >= nframes - 2:
+        fit_start_idx = max(0, nframes - 10)
+        print(f"    [WARN] fit_start 过大，调整为 {fit_start_idx / nframes:.2f}")
+
+    t_fit = t_ps[fit_start_idx:]
+    msd_fit = msd[fit_start_idx:]
+
+    intercept, slope = linear_fit(t_fit, msd_fit)
+
+    # D = slope / 6 (3D 扩散)
+    # 单位: [MSD] = Å², [t] = ps => slope = Å²/ps
+    # D(Å²/ps) = slope / 6
+    # D(cm²/s) = D(Å²/ps) * 1e-4
+    D_A2_ps = slope / 6.0
+    D_cm2_s = D_A2_ps * 1e-4
+
+    # 9. 输出摘要
+    print("\n" + "=" * 60)
+    print("计算结果摘要")
+    print("=" * 60)
+    print(f"总帧数: {nframes}")
+    print(f"时间步长 dt: {args.dt_fs} fs = {dt_ps} ps")
+    print(f"总模拟时间: {t_ps[-1]:.3f} ps")
+    print(f"MSD 末值: {msd[-1]:.4f} Å²")
+    print(f"拟合区间: {t_fit[0]:.3f} ~ {t_fit[-1]:.3f} ps ({len(t_fit)} 点)")
+    print(f"拟合斜率: {slope:.6f} Å²/ps")
+    print("-" * 60)
+    print(f"扩散系数 D = {D_A2_ps:.6e} Å²/ps")
+    print(f"扩散系数 D = {D_cm2_s:.6e} cm²/s")
+    print("=" * 60)
+    print(f"\n[OK] MSD 数据已保存到: {outfile}")
+
+
+if __name__ == "__main__":
+    main()
+
