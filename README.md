@@ -1,7 +1,3 @@
-# ABOUT-DFT-AND-MD
-VASP PACKMOL HTPOLYNET GROMACS AND SOMETHING ELSE
-  This repository contains code I developed for molecular simulations. Primarily, it uses VASP to calculate the Density of States (DOS) and work function, while enabling an automated workflow from PACKMOL to HTPOLYNET and subsequently to GROMACS. As my research focuses on gel electrolytes, components should be input in the order of salt + polymer matrix + crosslinker + initiator. After inputting the components sequentially, you can obtain your desired results/outputs directly from GROMACS. Overall, the workflow is relatively user-friendly. The code has undergone multiple revisions and updates, with numerous custom scripts integrated to meet my specific research needs.
-  Special thanks to Dr. Lu Tian for his excellent MULTIWFN software. Please feel free to raise any questions or issues if encountered.
 # VASP Scripts - 凝胶电解质计算工作流
 
 针对 VASP (oneAPI + Intel MPI) 环境的计算辅助脚本集合，适用于凝胶电解质、AIMD 等计算任务。
