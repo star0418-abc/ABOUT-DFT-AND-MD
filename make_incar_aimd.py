@@ -5,13 +5,14 @@ make_incar_aimd.py - 根据 recipe.yaml 生成 AIMD INCAR 文件
 
 功能：
   - 读取 recipe.yaml 的 simulation 段
-  - 生成适用于凝胶电解质的 AIMD INCAR
-  - 支持 Langevin 和 Nosé-Hoover 恒温器
-  - 支持从 INCAR.base 继承基础参数
-  - 强制设置 ISYM=0（AIMD 必须关闭对称性）
+  - 自动检测含 H 体系并调整 POTIM
+  - 支持 Langevin/Nosé-Hoover 恒温器（含 gamma 警告）
+  - 支持两段式 INCAR（平衡/生产）
+  - 强制 ISYM=0，MAXMIX 可配置
 
 用法：
-  python3 make_incar_aimd.py [--recipe recipe.yaml] [--out INCAR] [--exe vasp_std]
+  python3 make_incar_aimd.py [--recipe recipe.yaml] [--out INCAR]
+  python3 make_incar_aimd.py --two_stage  # 生成 INCAR.eq 和 INCAR.prod
 
 作者：STAR0418-ABC
 """
@@ -20,9 +21,8 @@ import argparse
 import sys
 import os
 from datetime import datetime
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Tuple, Optional
 
-# 尝试导入 yaml
 try:
     import yaml
     HAS_YAML = True
@@ -47,32 +47,20 @@ def load_yaml(filepath: str) -> Dict[str, Any]:
 
 
 def parse_incar_base(filepath: str) -> Dict[str, str]:
-    """
-    解析 INCAR.base 文件，返回参数字典
-
-    格式: KEY = VALUE 或 KEY=VALUE
-    忽略注释行（以 # 或 ! 开头）
-    """
+    """解析 INCAR.base 文件"""
     params = {}
-
     if not os.path.isfile(filepath):
         return params
 
     with open(filepath, 'r', encoding='utf-8') as f:
         for line in f:
             line = line.strip()
-
-            # 跳过空行和注释
             if not line or line.startswith('#') or line.startswith('!'):
                 continue
-
-            # 处理行内注释
             if '#' in line:
                 line = line.split('#')[0].strip()
             if '!' in line:
                 line = line.split('!')[0].strip()
-
-            # 解析 KEY = VALUE
             if '=' in line:
                 parts = line.split('=', 1)
                 key = parts[0].strip().upper()
@@ -83,77 +71,123 @@ def parse_incar_base(filepath: str) -> Dict[str, str]:
 
 
 def format_ediff(value: float) -> str:
-    """格式化 EDIFF 为标准科学计数法"""
+    """格式化 EDIFF"""
     if value >= 1e-4:
         return f"{value:.1E}"
     else:
         return f"{value:.0E}"
 
 
-def generate_incar_aimd(sim: Dict, base_params: Dict, exe: str = None) -> str:
-    """
-    生成 AIMD INCAR 内容
+def detect_h_in_poscar(poscar_path: str = "POSCAR") -> bool:
+    """检测 POSCAR 是否含 H 原子"""
+    if not os.path.isfile(poscar_path):
+        return False
+    
+    with open(poscar_path, 'r') as f:
+        lines = f.readlines()
+    
+    if len(lines) < 6:
+        return False
+    
+    # 第 6 行是元素符号
+    elements = lines[5].split()
+    return 'H' in elements
 
-    参数:
-        sim: simulation 配置字典
-        base_params: 从 INCAR.base 继承的参数
-        exe: 可执行文件名（仅用于注释）
 
-    返回:
-        INCAR 文件内容字符串
-    """
+def check_gamma_warning(gamma: float, thermostat: str) -> Optional[str]:
+    """检查 gamma 值是否过大"""
+    if thermostat != 'langevin':
+        return None
+    
+    if gamma >= 50:
+        return f"[ERROR] gamma={gamma} 极大，将严重抑制动力学！建议 5-20"
+    elif gamma >= 20:
+        return f"[WARN] gamma={gamma} 较大，可能抑制真实扩散，建议用于平衡段"
+    elif gamma >= 10:
+        return f"[INFO] gamma={gamma} 适中，平衡段适用；生产段建议 1-5"
+    else:
+        return None
+
+
+def generate_incar_content(
+    sim: Dict,
+    base_params: Dict,
+    stage_name: Optional[str] = None,
+    exe: str = None,
+    has_h: bool = False
+) -> str:
+    """生成 INCAR 内容"""
+    
     # 提取参数
     temp_c = sim.get('temperature_C', 25)
     temp_k = round(temp_c + 273.15, 1)
-    dt_fs = sim.get('dt_fs', 1.0)
+    
+    # POTIM: 含 H 默认 1.0，否则 2.0
+    default_potim = 1.0 if has_h else 2.0
+    dt_fs = sim.get('dt_fs', default_potim)
+    
+    # 如果含 H 且用户设置了大于 1.5 的 POTIM，警告
+    if has_h and dt_fs > 1.5:
+        print(f"[WARN] 体系含 H 原子，POTIM={dt_fs} fs 可能过大，建议 0.5-1.0 fs")
+    
     nsteps = sim.get('nsteps', 10000)
-    ensemble = sim.get('ensemble', 'nvt').lower()
     thermostat = sim.get('thermostat', 'langevin').lower()
+    
+    # gamma 参数
     gamma = sim.get('gamma_1ps', 10.0)
+    if stage_name == 'eq':
+        gamma = sim.get('gamma_eq_1ps', sim.get('gamma_1ps', 10.0))
+    elif stage_name == 'prod':
+        gamma = sim.get('gamma_prod_1ps', sim.get('gamma_1ps', 5.0))
+    
+    # gamma 警告
+    gamma_warn = check_gamma_warning(gamma, thermostat)
+    if gamma_warn:
+        print(gamma_warn)
+    
     smass = sim.get('smass', -3)
     nelm = sim.get('nelm', 100)
     ediff = sim.get('ediff', 1e-5)
     encut = sim.get('encut', None)
-    isym = sim.get('isym', 0)  # AIMD 必须为 0
+    isym = 0  # 强制
     maxmix = sim.get('maxmix', 40)
 
-    # 生成时间戳
     timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-
-    # 需要跳过的 INCAR.base 参数（将被 AIMD 参数覆盖）
+    
     skip_keys = [
         'IBRION', 'NSW', 'POTIM', 'TEBEG', 'TEEND', 'SMASS',
         'MDALGO', 'LANGEVIN_GAMMA', 'LWAVE', 'LCHARG',
-        'NELM', 'EDIFF', 'ISTART', 'ICHARG',
-        'ISYM', 'MAXMIX'  # 强制由脚本控制
+        'NELM', 'EDIFF', 'ISTART', 'ICHARG', 'ISYM', 'MAXMIX'
     ]
-
-    # 检查 base 中是否有 LASPH 和 ADDGRID
+    
     has_lasph = 'LASPH' in base_params
     has_addgrid = 'ADDGRID' in base_params
 
     lines = []
 
-    # ==================== 文件头注释 ====================
+    # 文件头
     lines.append("# " + "=" * 70)
     lines.append("# INCAR for AIMD - Generated by make_incar_aimd.py")
     lines.append("# " + "=" * 70)
     lines.append(f"# 生成时间: {timestamp}")
+    if stage_name:
+        lines.append(f"# 阶段: {stage_name.upper()}")
     lines.append(f"# 温度: {temp_c} °C = {temp_k} K")
-    lines.append(f"# 时间步长: {dt_fs} fs")
+    lines.append(f"# 时间步长: {dt_fs} fs" + (" (体系含 H)" if has_h else ""))
     lines.append(f"# 总步数: {nsteps}")
-    lines.append(f"# 系综: {ensemble.upper()}")
     lines.append(f"# 恒温器: {thermostat}")
     if thermostat == 'langevin':
-        lines.append(f"# 摩擦系数: {gamma} 1/ps")
-    lines.append(f"# ISYM: {isym} (AIMD 必须关闭对称性)")
+        lines.append(f"# Langevin gamma: {gamma} 1/ps")
+        if gamma >= 10:
+            lines.append(f"# ⚠️ gamma 较大，适合平衡段；生产段建议 1-5")
+    lines.append(f"# ISYM: {isym} (强制关闭)")
     lines.append(f"# MAXMIX: {maxmix}")
     if exe:
         lines.append(f"# 可执行文件: {exe}")
     lines.append("# " + "=" * 70)
     lines.append("")
 
-    # ==================== 基础参数（从 INCAR.base 继承）====================
+    # 继承参数
     if base_params:
         lines.append("# ============ 继承自 INCAR.base ============")
         for key, value in base_params.items():
@@ -161,116 +195,101 @@ def generate_incar_aimd(sim: Dict, base_params: Dict, exe: str = None) -> str:
                 lines.append(f"{key} = {value}")
         lines.append("")
 
-    # ==================== 体系相关参数（若无 INCAR.base 则提醒）====================
+    # 基础参数
     if not base_params:
-        lines.append("# ============ 体系相关参数（请手动补齐）============")
-        lines.append("# 注意: 未找到 INCAR.base，请确保设置以下参数:")
-        lines.append("#   ENCUT  - 截断能 (eV)")
-        lines.append("#   PREC   - 精度 (Normal/Accurate)")
-        lines.append("#   ALGO   - 电子步算法")
-        lines.append("#   ISMEAR - 展宽方法 (建议 0 用于分子/有机体系)")
-        lines.append("#   SIGMA  - 展宽值 (eV)")
-        lines.append("")
+        lines.append("# ============ 基础参数 ============")
         if encut:
             lines.append(f"ENCUT = {encut}")
         else:
             lines.append("# ENCUT = 400  # 请根据 POTCAR 设置")
         lines.append("PREC = Normal")
-        lines.append("ALGO = VeryFast  # 或 Fast，AIMD 推荐")
+        lines.append("ALGO = VeryFast")
         lines.append("ISMEAR = 0")
         lines.append("SIGMA = 0.05")
         lines.append("")
     elif encut:
-        # 如果 recipe.yaml 指定了 ENCUT，覆盖 base
         lines.append(f"ENCUT = {encut}  # 来自 recipe.yaml")
         lines.append("")
-
-    # ==================== 初始化参数 ====================
+    
+    # 初始化
     lines.append("# ============ 初始化 ============")
-    lines.append("ISTART = 0   # 从头开始")
-    lines.append("ICHARG = 2   # 使用原子电荷")
+    lines.append("ISTART = 0")
+    lines.append("ICHARG = 2")
     lines.append("")
-
-    # ==================== 电子步参数 ====================
+    
+    # 电子步
     lines.append("# ============ 电子步收敛 ============")
-    lines.append(f"NELM = {nelm}    # 最大电子步数")
-    lines.append(f"EDIFF = {format_ediff(ediff)}  # 电子步收敛判据 (eV)")
-    lines.append(f"MAXMIX = {maxmix}   # 电荷密度混合历史，建议 40-80")
+    lines.append(f"NELM = {nelm}")
+    lines.append(f"EDIFF = {format_ediff(ediff)}")
+    lines.append(f"MAXMIX = {maxmix}   # 电荷混合历史，建议 40-80")
     lines.append("")
 
-    # ==================== AIMD 稳定性：强制 ISYM=0 ====================
-    lines.append("# ============ 对称性（AIMD 必须关闭）============")
-    lines.append(f"ISYM = {isym}    # AIMD 必须关闭对称性，否则可能出错")
+    # 对称性
+    lines.append("# ============ 对称性 (AIMD 必须关闭) ============")
+    lines.append(f"ISYM = {isym}")
     lines.append("")
 
-    # ==================== MD 核心参数 ====================
-    lines.append("# ============ 分子动力学 (MD) ============")
+    # MD 参数
+    lines.append("# ============ 分子动力学 ============")
     lines.append("IBRION = 0   # MD 模式")
-    lines.append(f"NSW = {nsteps}    # 离子步数")
+    lines.append(f"NSW = {nsteps}")
     lines.append(f"POTIM = {dt_fs}   # 时间步长 (fs)")
     lines.append("")
 
-    # ==================== 温度控制 ====================
+    # 温度
     lines.append("# ============ 温度控制 ============")
-    # 使用整数或一位小数表示温度
-    if temp_k == int(temp_k):
-        temp_k_str = str(int(temp_k))
-    else:
-        temp_k_str = f"{temp_k:.1f}"
-    lines.append(f"TEBEG = {temp_k_str}  # 初始温度 (K) = {temp_c} °C")
-    lines.append(f"TEEND = {temp_k_str}  # 终止温度 (K)")
+    temp_k_str = str(int(temp_k)) if temp_k == int(temp_k) else f"{temp_k:.1f}"
+    lines.append(f"TEBEG = {temp_k_str}")
+    lines.append(f"TEEND = {temp_k_str}")
     lines.append("")
 
-    # ==================== 恒温器设置 ====================
+    # 恒温器
     lines.append("# ============ 恒温器 ============")
-
     if thermostat == 'langevin':
-        lines.append("MDALGO = 2   # Langevin 恒温器")
+        lines.append("MDALGO = 2   # Langevin")
         lines.append(f"LANGEVIN_GAMMA = {gamma}  # 摩擦系数 (1/ps)")
-        lines.append("# LANGEVIN_GAMMA 对每种原子类型，数值越大控温越强")
-        lines.append("# 建议范围: 5-20, 凝胶体系可用 10-15")
+        lines.append("# VASP 要求: 对每种原子类型指定 gamma")
+        lines.append("# 建议: 平衡段 10-20, 生产段 1-5")
+        if gamma >= 10:
+            lines.append("# ⚠️ 当前 gamma 较大，适合平衡/控温；")
+            lines.append("#    若用于扩散计算，建议减小到 1-5")
     elif thermostat == 'nose_hoover':
-        lines.append("MDALGO = 3   # Nosé-Hoover 恒温器")
-        lines.append(f"SMASS = {smass}   # 质量参数")
-        lines.append("# SMASS: -3=自动, 0=NVE, >0=手动设置周期")
-        lines.append("# 建议: -3 (自动) 或 ~0.5-3 (手动)")
+        lines.append("MDALGO = 3   # Nosé-Hoover")
+        lines.append(f"SMASS = {smass}")
     else:
-        # NVE 或未知
-        lines.append("# MDALGO = 1  # NVE (微正则系综，无恒温)")
         lines.append("MDALGO = 2   # Langevin (默认)")
         lines.append(f"LANGEVIN_GAMMA = {gamma}")
-
     lines.append("")
 
-    # ==================== 推荐参数：LASPH, ADDGRID ====================
+    # 推荐参数
     lines.append("# ============ 推荐参数 ============")
     if not has_lasph:
-        lines.append("LASPH = .TRUE.   # 非球形贡献，含 d/f 电子体系推荐")
+        lines.append("LASPH = .TRUE.")
     if not has_addgrid:
-        lines.append("ADDGRID = .TRUE. # 额外 FFT 网格，提高精度")
-    if has_lasph or has_addgrid:
-        lines.append("# LASPH/ADDGRID 已在 INCAR.base 中设置")
+        lines.append("ADDGRID = .TRUE.")
     lines.append("")
 
-    # ==================== 输出控制（节省空间）====================
-    lines.append("# ============ 输出控制 (AIMD 节省空间) ============")
-    lines.append("LWAVE = .FALSE.   # 不写 WAVECAR")
-    lines.append("LCHARG = .FALSE.  # 不写 CHGCAR")
-    lines.append("LREAL = Auto      # 实空间投影 (大体系推荐)")
+    # 输出控制
+    lines.append("# ============ 输出控制 ============")
+    lines.append("LWAVE = .FALSE.")
+    lines.append("LCHARG = .FALSE.")
+    lines.append("LREAL = Auto")
     lines.append("")
 
-    # ==================== 可选优化参数 ====================
-    lines.append("# ============ 性能优化 (可选) ============")
-    lines.append("# NCORE = 4       # 每个 orbital 的核数 (根据节点调整)")
-    lines.append("# KPAR = 1        # K点并行 (Gamma-only 设为 1)")
-    lines.append("# NSIM = 4        # RMM-DIIS 并行带数")
+    # 性能
+    lines.append("# ============ 性能优化 ============")
+    lines.append("# NCORE = 4")
+    lines.append("# KPAR = 1")
     lines.append("")
 
-    # ==================== 结束 ====================
+    # 结尾
     lines.append("# " + "=" * 70)
-    lines.append("# 运行命令: NP=16 EXE=vasp_std run_vasp.sh")
+    if stage_name == 'eq':
+        lines.append("# 平衡段：用于系统温度稳定，不用于动力学分析")
+    elif stage_name == 'prod':
+        lines.append("# 生产段：用于轨迹采样和扩散分析")
+    lines.append("# 运行: NP=16 EXE=vasp_std run_vasp.sh")
     lines.append("# 监控: aimd_watch.sh")
-    lines.append("# 后处理: python3 aimd_post.py && python3 aimd_msd.py --specie Li --dt_fs " + str(dt_fs))
     lines.append("# " + "=" * 70)
 
     return '\n'.join(lines)
@@ -282,14 +301,13 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
-    # 生成 INCAR.aimd
-    python3 make_incar_aimd.py
-
-    # 直接生成 INCAR
     python3 make_incar_aimd.py --out INCAR
+    python3 make_incar_aimd.py --two_stage  # 生成 INCAR.eq 和 INCAR.prod
 
-    # 使用自定义配方
-    python3 make_incar_aimd.py --recipe my_recipe.yaml --out INCAR
+两段式说明:
+    - INCAR.eq: 平衡段，gamma 较大（默认 10），用于快速控温
+    - INCAR.prod: 生产段，gamma 较小（默认 5），用于扩散分析
+    - 平衡段结束后，将 CONTCAR 复制为 POSCAR 再运行生产段
         """
     )
     parser.add_argument("--recipe", default="recipe.yaml",
@@ -298,85 +316,127 @@ def main():
                         help="输出 INCAR 文件路径 (默认: INCAR.aimd)")
     parser.add_argument("--exe", default=None,
                         help="可执行文件名 (可选，仅记录到注释)")
+    parser.add_argument("--two_stage", action="store_true",
+                        help="生成两段式 INCAR (INCAR.eq 和 INCAR.prod)")
+    parser.add_argument("--poscar", default="POSCAR",
+                        help="POSCAR 文件路径，用于检测是否含 H")
 
     args = parser.parse_args()
 
     print("=" * 70)
-    print("make_incar_aimd.py - AIMD INCAR 生成器")
+    print("make_incar_aimd.py - AIMD INCAR 生成器 (v2.0)")
     print("=" * 70)
     print(f"配方文件: {args.recipe}")
-    print(f"输出文件: {args.out}")
+    
+    if args.two_stage:
+        print("模式: 两段式 (eq + prod)")
+    else:
+        print(f"输出文件: {args.out}")
 
     # 加载配方
     data = load_yaml(args.recipe)
-
-    # 检查 simulation 段
     sim = data.get('simulation', None)
     if sim is None:
         print("[ERROR] recipe.yaml 中未找到 'simulation' 段")
         sys.exit(1)
 
-    mode = sim.get('mode', 'static')
-    if mode != 'aimd':
-        print(f"[WARN] simulation.mode = '{mode}'，非 AIMD 模式")
-        print("[INFO] 将继续生成 AIMD INCAR，请确认这是您需要的")
-
     # 验证必需参数
-    if 'temperature_C' not in sim:
-        print("[ERROR] simulation 中缺少 'temperature_C'")
-        sys.exit(1)
+    for key in ['temperature_C', 'dt_fs', 'nsteps']:
+        if key not in sim:
+            print(f"[ERROR] simulation 中缺少 '{key}'")
+            sys.exit(1)
 
-    if 'dt_fs' not in sim:
-        print("[ERROR] simulation 中缺少 'dt_fs'")
-        sys.exit(1)
+    # 检测是否含 H
+    has_h = detect_h_in_poscar(args.poscar)
+    if has_h:
+        print("\n[INFO] 检测到体系含 H 原子")
+        default_potim = sim.get('dt_fs', 2.0)
+        if default_potim > 1.5:
+            print(f"[WARN] 当前 dt_fs={default_potim}，含 H 建议 0.5-1.0 fs")
 
-    if 'nsteps' not in sim:
-        print("[ERROR] simulation 中缺少 'nsteps'")
-        sys.exit(1)
-
-    # 读取 INCAR.base（如果存在）
+    # 读取 INCAR.base
     base_params = {}
     if os.path.isfile('INCAR.base'):
         print("\n>>> 检测到 INCAR.base，将继承其参数...")
         base_params = parse_incar_base('INCAR.base')
         print(f"    读取 {len(base_params)} 个参数")
     else:
-        print("\n>>> 未找到 INCAR.base，将生成完整 INCAR 模板")
+        print("\n>>> 未找到 INCAR.base，将生成完整模板")
 
     # 生成 INCAR
-    incar_content = generate_incar_aimd(sim, base_params, args.exe)
+    if args.two_stage:
+        # 两段式
+        stages = sim.get('stages', None)
+        
+        if stages:
+            # 使用 recipe 中定义的阶段
+            for stage in stages:
+                stage_name = stage.get('name', 'unknown')
+                stage_sim = sim.copy()
+                stage_sim.update(stage)
+                
+                content = generate_incar_content(stage_sim, base_params, stage_name, args.exe, has_h)
+                outfile = f"INCAR.{stage_name}"
+                with open(outfile, 'w', encoding='utf-8') as f:
+                    f.write(content)
+                print(f"\n>>> 已写入: {outfile}")
+        else:
+            # 默认两段
+            # 平衡段
+            eq_sim = sim.copy()
+            eq_sim['gamma_1ps'] = sim.get('gamma_eq_1ps', 10.0)
+            eq_sim['nsteps'] = sim.get('nsteps_eq', sim.get('nsteps', 10000) // 5)
+            
+            eq_content = generate_incar_content(eq_sim, base_params, 'eq', args.exe, has_h)
+            with open('INCAR.eq', 'w', encoding='utf-8') as f:
+                f.write(eq_content)
+            print("\n>>> 已写入: INCAR.eq (平衡段)")
 
-    # 写入文件
+            # 生产段
+            prod_sim = sim.copy()
+            prod_sim['gamma_1ps'] = sim.get('gamma_prod_1ps', 5.0)
+            
+            prod_content = generate_incar_content(prod_sim, base_params, 'prod', args.exe, has_h)
+            with open('INCAR.prod', 'w', encoding='utf-8') as f:
+                f.write(prod_content)
+            print(">>> 已写入: INCAR.prod (生产段)")
+            
+            print("\n两段式用法:")
+            print("  1. cp INCAR.eq INCAR && run_vasp.sh")
+            print("  2. cp CONTCAR POSCAR")
+            print("  3. cp INCAR.prod INCAR && run_vasp.sh")
+            print("  4. 扩散分析只用生产段轨迹")
+    else:
+        # 单一 INCAR
+        content = generate_incar_content(sim, base_params, None, args.exe, has_h)
     with open(args.out, 'w', encoding='utf-8') as f:
-        f.write(incar_content)
-
-    print(f"\n>>> INCAR 已写入: {args.out}")
+        f.write(content)
+        print(f"\n>>> 已写入: {args.out}")
 
     # 打印摘要
     temp_c = sim.get('temperature_C', 25)
     temp_k = round(temp_c + 273.15, 1)
     dt_fs = sim.get('dt_fs', 1.0)
     nsteps = sim.get('nsteps', 10000)
-    total_time_ps = dt_fs * nsteps / 1000.0
-    maxmix = sim.get('maxmix', 40)
+    gamma = sim.get('gamma_1ps', 10.0)
+    thermostat = sim.get('thermostat', 'langevin')
 
     print("\n" + "=" * 70)
     print("INCAR 生成摘要")
     print("=" * 70)
     print(f"温度: {temp_c} °C = {temp_k} K")
-    print(f"时间步长: {dt_fs} fs")
+    print(f"时间步长: {dt_fs} fs" + (" (体系含 H)" if has_h else ""))
     print(f"总步数: {nsteps}")
-    print(f"总模拟时间: {total_time_ps:.2f} ps")
-    print(f"恒温器: {sim.get('thermostat', 'langevin')}")
-    print(f"ISYM: {sim.get('isym', 0)} (AIMD 必须为 0)")
-    print(f"MAXMIX: {maxmix}")
+    print(f"恒温器: {thermostat}")
+    if thermostat == 'langevin':
+        print(f"Langevin gamma: {gamma} 1/ps")
+        if gamma >= 10:
+            print("  ⚠️ gamma 较大，适合平衡段；生产段建议 1-5")
+    print(f"ISYM: 0 (强制关闭)")
+    print(f"MAXMIX: {sim.get('maxmix', 40)}")
     print("=" * 70)
 
     print("\n[OK] INCAR 生成完成！")
-    print("\n下一步:")
-    print("  1. 检查 POSCAR, POTCAR, KPOINTS 是否就绪")
-    print("  2. 运行: NP=16 EXE=vasp_std run_vasp.sh")
-    print("  3. 监控: aimd_watch.sh")
 
 
 if __name__ == "__main__":
