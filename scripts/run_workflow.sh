@@ -402,9 +402,12 @@ run_htpolynet_phase() {
     cd "$PROJECT_ROOT"
     
     # 从 recipe.yaml 读取 HTPolyNet 参数
-    local n_monomers=$(grep -A10 "^htpolynet:" "$RECIPE_FILE" | grep "n_monomers:" | head -1 | awk '{print $2}' || echo "50")
-    local conversion=$(grep -A20 "^htpolynet:" "$RECIPE_FILE" | grep "desired_conversion:" | head -1 | awk '{print $2}' || echo "0.60")
-    local seed=$(grep -A20 "^htpolynet:" "$RECIPE_FILE" | grep "random_seed:" | head -1 | awk '{print $2}' || echo "2025")
+    local n_monomers
+    local conversion
+    local seed
+    n_monomers=$(grep -A10 "^htpolynet:" "$RECIPE_FILE" | grep "n_monomers:" | head -1 | awk '{print $2}' || true)
+    conversion=$(grep -A20 "^htpolynet:" "$RECIPE_FILE" | grep "desired_conversion:" | head -1 | awk '{print $2}' || true)
+    seed=$(grep -A20 "^htpolynet:" "$RECIPE_FILE" | grep "random_seed:" | head -1 | awk '{print $2}' || true)
     
     # 使用较小的值进行快速演示
     n_monomers="${n_monomers:-50}"
@@ -545,12 +548,50 @@ run_gromacs_phase() {
     local gmx_dir="${RUN_DIR}/gromacs"
     local packmol_pdb="${RUN_DIR}/packmol/gel.pdb"
     local network_pdb="${RUN_DIR}/htpolynet/network.pdb"
-    
-    cd "$gmx_dir"
-    
-    # 选择输入结构
+    local merged_pdb="${gmx_dir}/gel_merged.pdb"
     local input_pdb=""
-    if [[ -f "$packmol_pdb" ]]; then
+    local topology_input="${gmx_dir}/gel.pdb"
+
+    mkdir -p "$gmx_dir"
+    cd "$gmx_dir"
+
+    # 选择输入结构（若两者存在则合并）
+    if [[ -f "$packmol_pdb" ]] && [[ -f "$network_pdb" ]]; then
+        info "检测到 Packmol + HTPolyNet，合并结构..."
+        "$PYTHON" << PYTHON_SCRIPT 2>&1 | tee -a "$LOG_FILE"
+import itertools
+from pathlib import Path
+
+packmol = Path("${packmol_pdb}")
+network = Path("${network_pdb}")
+output = Path("${merged_pdb}")
+
+def read_atoms(path):
+    lines = []
+    with path.open() as fh:
+        for line in fh:
+            if line.startswith(("ATOM", "HETATM")):
+                lines.append(line.rstrip("\n"))
+    return lines
+
+atoms = read_atoms(packmol) + read_atoms(network)
+if not atoms:
+    raise SystemExit("ERROR: 未找到可合并的 ATOM/HETATM 行")
+
+renumbered = []
+for idx, line in enumerate(atoms, start=1):
+    renumbered.append(f"{line[:6]}{idx:5d}{line[11:]}")
+
+output.parent.mkdir(parents=True, exist_ok=True)
+with output.open("w") as fh:
+    for line in renumbered:
+        fh.write(line + "\n")
+    fh.write("END\n")
+
+print(f"已生成合并结构: {output}")
+PYTHON_SCRIPT
+        input_pdb="$merged_pdb"
+    elif [[ -f "$packmol_pdb" ]]; then
         input_pdb="$packmol_pdb"
     elif [[ -f "$network_pdb" ]]; then
         input_pdb="$network_pdb"
@@ -558,87 +599,79 @@ run_gromacs_phase() {
         warn "没有可用的输入结构，跳过 GROMACS"
         return 0
     fi
-    
+
     info "使用输入结构: $input_pdb"
-    cp "$input_pdb" conf.pdb
-    
-    # 创建简化拓扑
-    info "创建拓扑..."
-    
-    cat > topol.top << 'EOF'
-[ defaults ]
-  1      2         yes       0.5     0.8333
+    cp "$input_pdb" "$topology_input"
 
-[ atomtypes ]
-LI       3      6.941    1.0     A       0.182     0.07648
-N        7     14.007   -0.8     A       0.325     0.71128
-S       16     32.066    1.0     A       0.356     1.04600
-O        8     15.999   -0.5     A       0.296     0.87864
-C        6     12.011    0.0     A       0.340     0.35982
-F        9     18.998   -0.2     A       0.295     0.22175
-H        1      1.008    0.0     A       0.250     0.06276
-
-[ moleculetype ]
-MOL     3
-
-[ atoms ]
-  1   C     1      MOL     C1    1     0.0    12.011
-
-[ system ]
-Gel Electrolyte
-
-[ molecules ]
-MOL     1
-EOF
-
-    # 创建盒子
-    info "创建模拟盒子..."
-    gmx editconf -f conf.pdb -o box.gro -c -box 4 4 4 -bt cubic 2>&1 | tee -a "$LOG_FILE" || true
-    
-    if [[ ! -f box.gro ]]; then
-        warn "editconf 失败，使用原始结构"
-        cp conf.pdb box.gro
+    info "生成 GAFF2 拓扑..."
+    if ! "$PYTHON" "${SCRIPT_DIR}/generate_topology.py" \
+        -i "$gmx_dir" \
+        -c "$RECIPE_FILE" \
+        -o "$gmx_dir" 2>&1 | tee -a "$LOG_FILE"; then
+        warn "拓扑生成失败，跳过 GROMACS"
+        return 0
     fi
-    
-    # 创建 EM MDP
-    cat > em.mdp << 'EOF'
-integrator  = steep
-emtol       = 1000.0
-emstep      = 0.01
-nsteps      = 1000
-nstxout     = 0
-nstvout     = 0
-nstenergy   = 100
-nstlog      = 100
-cutoff-scheme = Verlet
-nstlist     = 10
-pbc         = xyz
-coulombtype = Cut-off
-rcoulomb    = 1.0
-vdwtype     = Cut-off
-rvdw        = 1.0
-EOF
 
-    # 运行 EM
-    info "运行能量最小化..."
-    if gmx grompp -f em.mdp -c box.gro -p topol.top -o em.tpr -maxwarn 10 2>&1 | tee -a "$LOG_FILE"; then
-        if gmx mdrun -v -deffnm em 2>&1 | tee -a "$LOG_FILE"; then
-            success "能量最小化完成"
-            cp em.gro "${RUN_DIR}/final_structure.gro"
-        else
-            warn "mdrun 失败（拓扑可能不完整）"
+    if [[ ! -f "${gmx_dir}/topol.top" ]]; then
+        warn "未找到 topol.top，跳过 GROMACS"
+        return 0
+    fi
+
+    local current_gro="${gmx_dir}/system.gro"
+    if [[ ! -f "$current_gro" ]]; then
+        warn "未找到 system.gro，跳过 GROMACS"
+        return 0
+    fi
+
+    local run_stage
+    run_stage() {
+        local stage_name="$1"
+        local mdp_file="$2"
+
+        if [[ ! -f "$mdp_file" ]]; then
+            warn "缺少 MDP: $mdp_file，跳过 ${stage_name}"
+            return 0
         fi
-    else
-        warn "grompp 失败（拓扑可能不完整）"
+
+        info "运行 ${stage_name}..."
+        if ! gmx grompp -f "$mdp_file" -c "$current_gro" -p topol.top -o "${stage_name}.tpr" -maxwarn 10 2>&1 | tee -a "$LOG_FILE"; then
+            warn "${stage_name} grompp 失败"
+            return 1
+        fi
+        if ! gmx mdrun -v -deffnm "${stage_name}" 2>&1 | tee -a "$LOG_FILE"; then
+            warn "${stage_name} mdrun 失败"
+            return 1
+        fi
+
+        if [[ -f "${stage_name}.gro" ]]; then
+            current_gro="${gmx_dir}/${stage_name}.gro"
+        fi
+        return 0
+    }
+
+    local npt_stage="npt.mdp"
+    if [[ -f "${MDP_DIR}/npt_ber.mdp" ]]; then
+        npt_stage="npt_ber.mdp"
+    elif [[ -f "${MDP_DIR}/npt.mdp" ]]; then
+        npt_stage="npt.mdp"
     fi
-    
-    # 复制最终结构
-    if [[ -f em.gro ]]; then
-        cp em.gro "${RUN_DIR}/final_structure.gro"
-    elif [[ -f box.gro ]]; then
-        cp box.gro "${RUN_DIR}/final_structure.gro"
+
+    run_stage "em" "${MDP_DIR}/em.mdp" || return 0
+    run_stage "nvt" "${MDP_DIR}/nvt.mdp" || return 0
+    run_stage "npt" "${MDP_DIR}/${npt_stage}" || return 0
+
+    if [[ -f "${MDP_DIR}/npt_pr.mdp" ]]; then
+        run_stage "npt_pr" "${MDP_DIR}/npt_pr.mdp" || return 0
     fi
-    
+
+    if [[ -f "${MDP_DIR}/md_prod.mdp" ]]; then
+        run_stage "md_prod" "${MDP_DIR}/md_prod.mdp" || return 0
+    fi
+
+    if [[ -f "$current_gro" ]]; then
+        cp "$current_gro" "${RUN_DIR}/final_structure.gro"
+    fi
+
     success "Phase 3 完成"
 }
 
@@ -654,48 +687,30 @@ run_coordination_phase() {
     fi
     
     local analysis_dir="${RUN_DIR}/analysis/coordination"
+    local gmx_dir="${RUN_DIR}/gromacs"
+    local tpr_file=""
+    local traj_file=""
+
     cd "$analysis_dir"
-    
-    # 创建 RDF/CN 数据
-    info "生成配位数分析..."
-    
-    cat > rdf_Li_O.xvg << 'EOF'
-# RDF Li-O
-@    title "Radial Distribution Function"
-@    xaxis  label "r (nm)"
-@    yaxis  label "g(r)"
-@TYPE xy
-0.10    0.00
-0.15    0.01
-0.20    1.50
-0.25    3.20
-0.30    2.80
-0.35    1.50
-0.40    1.10
-0.45    0.95
-0.50    1.02
-EOF
 
-    cat > cn_Li_O.xvg << 'EOF'
-# Coordination Number Li-O
-@    title "Coordination Number"
-@    xaxis  label "r (nm)"
-@    yaxis  label "CN"
-@TYPE xy
-0.10    0.00
-0.15    0.05
-0.20    0.80
-0.25    2.50
-0.30    4.20
-0.35    5.80
-0.40    7.00
-0.45    8.10
-0.50    9.00
-EOF
+    tpr_file=$(ls "${gmx_dir}"/*.tpr 2>/dev/null | tail -1 || true)
+    traj_file=$(ls "${gmx_dir}"/*.xtc 2>/dev/null | tail -1 || true)
 
-    local cn_value="5.80"
-    
-    cat > coordination_summary.txt << EOF
+    if [[ -z "$tpr_file" || -z "$traj_file" ]]; then
+        warn "缺少轨迹或 tpr，跳过配位数计算"
+        return 0
+    fi
+
+    if [[ ! -f "${gmx_dir}/index.ndx" ]]; then
+        warn "未找到 index.ndx，请先生成包含 LI 与 O 组的索引文件"
+        return 0
+    fi
+
+    info "使用 gmx rdf 计算配位数..."
+    if echo -e "LI\nO\n" | gmx rdf -f "$traj_file" -s "$tpr_file" -n "${gmx_dir}/index.ndx" -o rdf_Li_O.xvg -cn cn_Li_O.xvg 2>&1 | tee -a "$LOG_FILE"; then
+        local cn_value
+        cn_value=$(awk '($1>=0.35){print $2; exit}' cn_Li_O.xvg 2>/dev/null || true)
+        cat > coordination_summary.txt << EOF
 # ============================================
 # 配位数分析结果
 # ============================================
@@ -706,7 +721,7 @@ run_dir: ${RUN_DIR}
 recipe: ${RECIPE_FILE}
 
 # Li-O 配位数
-CN(Li-O) at r=0.35 nm: ${cn_value}
+CN(Li-O) at r=0.35 nm: ${cn_value:-N/A}
 
 # 说明
 note: 使用 gmx rdf -cn 计算
@@ -716,8 +731,11 @@ files:
   - rdf_Li_O.xvg
   - cn_Li_O.xvg
 EOF
-
-    success "Phase 4 完成: CN(Li-O)@0.35nm = ${cn_value}"
+        success "Phase 4 完成: CN(Li-O)@0.35nm = ${cn_value:-N/A}"
+    else
+        warn "gmx rdf 失败，跳过配位数结果输出"
+        return 0
+    fi
 }
 
 # ==============================================================================
@@ -827,4 +845,3 @@ main() {
 }
 
 main "$@"
-
