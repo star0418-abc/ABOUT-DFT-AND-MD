@@ -198,6 +198,10 @@ packmol:
   # 盒子放大系数 (1.0-2.0)
   # 推荐: 1.3-1.5 (小分子), 1.5-2.0 (长链聚合物)
   box_scale: 1.5
+
+  # 若检测到 HTPolyNet 交联网络 + 盐，自动放大 Packmol 盒子以降低填充失败风险
+  auto_box_scale_for_network: true
+  network_box_scale_min: 2.0
   
   # 随机种子 (-1 随机，正整数可复现)
   seed: 2025

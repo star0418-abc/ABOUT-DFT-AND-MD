@@ -389,6 +389,8 @@ def parse_recipe(cfg_path: Path, allow_missing_mw: bool) -> Tuple[Dict[str, Any]
     # defaults
     packmol_cfg.setdefault("tolerance_A", 2.0)
     packmol_cfg.setdefault("box_scale", 1.5)
+    packmol_cfg.setdefault("auto_box_scale_for_network", False)
+    packmol_cfg.setdefault("network_box_scale_min", 2.0)
     packmol_cfg.setdefault("seed", 12345)
     packmol_cfg.setdefault("filetype", "pdb")
     packmol_cfg.setdefault("output_pdb", "gel.pdb")
@@ -415,6 +417,49 @@ def parse_recipe(cfg_path: Path, allow_missing_mw: bool) -> Tuple[Dict[str, Any]
             raise ValueError(msg)
 
     return root, system_cfg, packmol_cfg, constraints, structures, salt_meta
+
+
+def has_dense_network(root: Dict[str, Any]) -> bool:
+    polymer_matrix = root.get("polymer_matrix", [])
+    if not isinstance(polymer_matrix, list):
+        return False
+    for item in polymer_matrix:
+        if not isinstance(item, dict):
+            continue
+        source = str(item.get("source", "")).lower()
+        if source == "htpolynet":
+            return True
+        file_path = str(item.get("file", "")).lower()
+        if "htpolynet" in file_path or "htpolynet_out" in file_path:
+            return True
+    return False
+
+
+def maybe_adjust_box_scale(
+    root: Dict[str, Any],
+    packmol_cfg: Dict[str, Any],
+    salt_meta: Dict[str, Any],
+) -> bool:
+    auto_scale = bool(packmol_cfg.get("auto_box_scale_for_network", False))
+    if not auto_scale:
+        return False
+    if not salt_meta:
+        return False
+    if not has_dense_network(root):
+        return False
+
+    box_scale = safe_float(packmol_cfg.get("box_scale", 1.5), 1.5)
+    min_scale = safe_float(packmol_cfg.get("network_box_scale_min", 2.0), 2.0)
+    if box_scale >= min_scale:
+        return False
+
+    packmol_cfg["box_scale"] = min_scale
+    eprint(
+        "[WARN] Detected HTPolyNet-style dense network + salt. "
+        f"Auto-increasing packmol box_scale from {box_scale:.2f} to {min_scale:.2f} "
+        "(set packmol.auto_box_scale_for_network=false to disable)."
+    )
+    return True
 
 
 # -----------------------------
@@ -638,6 +683,8 @@ def main():
         packmol_cfg["seed"] = int(args.seed)
     if args.output_pdb is not None:
         packmol_cfg["output_pdb"] = str(args.output_pdb)
+
+    maybe_adjust_box_scale(root, packmol_cfg, salt_meta)
 
     recipe_name = str(system_cfg.get("name", out_root.name))
     target_density = safe_float(system_cfg.get("target_density_g_cm3", 1.0), 1.0)
