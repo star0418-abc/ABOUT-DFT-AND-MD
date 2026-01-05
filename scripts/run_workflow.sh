@@ -702,6 +702,7 @@ run_coordination_phase() {
     fi
 
     if [[ ! -f "${gmx_dir}/index.ndx" ]]; then
+ codex/check-scripts/run_workflow.sh-zg1dqw
         warn "未找到 index.ndx，尝试自动生成..."
         if ! command -v gmx &>/dev/null; then
             warn "gmx 不可用，无法生成 index.ndx"
@@ -713,6 +714,10 @@ run_coordination_phase() {
             warn "自动生成 index.ndx 失败，请手动创建包含 LI 与 O 组的索引文件"
             return 0
         fi
+
+        warn "未找到 index.ndx，请先生成包含 LI 与 O 组的索引文件"
+        return 0
+cursor-sync
     fi
 
     info "使用 gmx rdf 计算配位数..."
