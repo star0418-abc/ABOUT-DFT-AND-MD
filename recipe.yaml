@@ -22,6 +22,7 @@
 #   - mw_g_mol: 分子量 (g/mol)
 #   - atoms_per_entity: 每个分子/实体的原子数
 #   - structure_file: 结构文件路径（.xyz/.pdb/.cif 等）
+#   - min_count: 最小分子数（用于 recipe_to_counts，默认 0）
 # ============================================================================
 
 # ======================= 模拟条件 =======================
@@ -30,40 +31,59 @@ simulation:
   mode: aimd              # aimd (分子动力学) / static (静态计算)
 
   # ---------- 温度设置（摄氏度）----------
-  # 程序会自动转换为开尔文: T_K = T_C + 273.15
-  temperature_C: 60
+  temperature_C: 60       # 自动转换为 K: T_K = T_C + 273.15
 
   # ---------- 时间参数 ----------
-  dt_fs: 1.0              # 时间步长 (fs) = POTIM
+  dt_fs: 1.0              # 时间步长 (fs) = POTIM (含 H 建议 0.5-1.0)
   nsteps: 10000           # 总步数 = NSW
 
   # ---------- 系综与恒温器 ----------
   ensemble: nvt           # nvt (正则系综) / nve (微正则系综)
   thermostat: langevin    # langevin / nose_hoover
-  gamma_1ps: 10.0         # Langevin 摩擦系数 (1/ps)，建议 5-20
+
+  # Langevin 摩擦系数 (1/ps)
+  # ⚠️ gamma 过大会抑制真实动力学！
+  #    - 平衡段建议: 10-20 (快速控温)
+  #    - 生产段建议: 1-5 (弱耦合，保留真实扩散)
+  gamma_1ps: 10.0         # 单一 INCAR 时使用
+
+  # 两段式参数（用于 --two_stage）
+  gamma_eq_1ps: 10.0      # 平衡段 gamma
+  gamma_prod_1ps: 5.0     # 生产段 gamma
+  nsteps_eq: 2000         # 平衡段步数（默认为 nsteps 的 1/5）
+
   smass: -3               # Nosé-Hoover 质量参数，-3=自动
 
   # ---------- 电子步参数 ----------
-  nelm: 100               # 最大电子步数
-  ediff: 1.0e-5           # 电子步收敛判据 (eV)
+  nelm: 100
+  ediff: 1.0e-5
 
   # ---------- AIMD 稳定性参数 ----------
-  isym: 0                 # AIMD 必须关闭对称性 (ISYM=0)
-  maxmix: 40              # MAXMIX 电荷密度混合历史，建议 40-80
+  isym: 0                 # AIMD 必须关闭对称性！
+  maxmix: 40              # 电荷密度混合历史，建议 40-80
 
   # ---------- 建模相关参数 ----------
-  # 注意：density 仅用于建盒子/Packmol/recipe_to_counts，非 VASP 参数
-  # AIMD 代表性小胞可能无法严格保持实验 wt%
-  density_g_cm3: 1.25     # 体系密度 (g/cm³)，用于计算盒子体积
-  builder: none           # 建模工具: none / packmol
-  target_atoms: 200       # AIMD 小体系目标原子数（用于验证/提示）
+  # ⚠️ density 仅用于建盒子/Packmol/recipe_to_counts，非 VASP 参数
+  # ⚠️ AIMD 代表性小胞可能无法严格保持实验 wt%
+  density_g_cm3: 1.25
+  builder: none           # none / packmol
+  target_atoms: 200       # AIMD 小体系目标原子数
 
-  # 允许小体系中 optional 组分 count=0（如引发剂占比太小）
+  # 允许小体系中 optional 组分 count=0
   allow_drop_low_fraction_components: true
 
   # ---------- 可选：截断能 ----------
-  # 如不指定，需在 INCAR.base 中提供或手动设置
-  # encut: 400
+  # encut: 400            # 如不指定，需在 INCAR.base 中提供
+
+  # ---------- 可选：两段式阶段定义 ----------
+  # 如需更细粒度控制，可定义 stages 列表
+  # stages:
+  #   - name: eq
+  #     nsteps: 2000
+  #     gamma_1ps: 15.0
+  #   - name: prod
+  #     nsteps: 10000
+  #     gamma_1ps: 3.0
 
 # ======================= 主要组分（四大类）=======================
 
@@ -75,6 +95,7 @@ salt_solution:
     mw_g_mol: 287.09
     atoms_per_entity: 15
     structure_file: structures/LiTFSI.xyz
+    min_count: 1          # 至少保留 1 个
 
   - name: "EC（碳酸乙烯酯）"
     wt_pct: 10.0
