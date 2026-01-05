@@ -1,0 +1,81 @@
+; ==============================================================================
+; nvt.mdp - NVT Equilibration (恒温平衡) - 生产版
+; ==============================================================================
+; 用途: 在恒定体积下平衡温度，建立合理的动能分布
+; 版本: Production v1.0
+; 适用: 聚合物/凝胶电解质体系
+;
+; 默认时长: 1 ns (500,000 步 × 2 fs)
+; 默认温度: 298 K (可按 recipe 修改)
+;
+; 与 smoke 版本的区别:
+;   - 更长的平衡时间 (1 ns vs 100 ps)
+;   - 使用 2 fs 时间步 (h-bonds 约束下稳定)
+;   - 更合理的输出频率 (10 ps 轨迹帧)
+;
+; 修改时长: 改 nsteps 即可
+;   - 1 ns  = 500000 步
+;   - 2 ns  = 1000000 步
+;   - 5 ns  = 2500000 步
+; ==============================================================================
+
+; ============== 运行控制 ==============
+integrator      = md            ; 分子动力学
+dt              = 0.002         ; 时间步长 2 fs
+nsteps          = 500000        ; 1 ns (500000 × 2 fs)
+
+; ============== 输出控制 ==============
+; 生产级输出策略: 平衡文件大小与分析精度
+nstxout         = 0             ; 不输出未压缩坐标
+nstvout         = 0             ; 不输出速度
+nstfout         = 0             ; 不输出力
+nstxout-compressed = 5000       ; 压缩轨迹每 10 ps (5000 × 2 fs)
+nstenergy       = 500           ; 能量每 1 ps (500 × 2 fs)
+nstlog          = 500           ; 日志每 1 ps
+nstcalcenergy   = 100           ; 能量计算频率
+
+; ============== 近邻列表 ==============
+cutoff-scheme   = Verlet        ; Verlet 缓冲区方案
+nstlist         = 20            ; 邻居列表更新频率 (每 40 fs)
+pbc             = xyz           ; 三维周期性边界条件
+verlet-buffer-tolerance = 0.005 ; Verlet 缓冲区容差 (kJ/mol/ps)
+
+; ============== 静电相互作用 (PME) ==============
+coulombtype     = PME           ; Particle Mesh Ewald
+rcoulomb        = 1.2           ; 实空间截断距离 (nm)
+fourierspacing  = 0.12          ; FFT 网格间距 (nm)
+pme-order       = 4             ; PME 插值阶数
+
+; ============== 范德华相互作用 ==============
+vdwtype         = Cut-off       ; 截断型 vdW
+vdw-modifier    = Potential-shift  ; 平滑截断
+rvdw            = 1.2           ; vdW 截断距离 (nm)
+DispCorr        = EnerPres      ; 长程色散校正
+
+; ============== 温度耦合 ==============
+tcoupl          = V-rescale     ; 速度重标定温控 (推荐用于平衡和生产)
+                                ; V-rescale 产生正确的正则系综
+tc-grps         = System        ; 整个体系一个温控组
+tau_t           = 0.1           ; 时间常数 (ps)，平衡阶段用较小值
+ref_t           = 298           ; 目标温度 (K) - 可按需修改
+
+; ============== 压力耦合 ==============
+pcoupl          = no            ; NVT 阶段关闭压力耦合
+
+; ============== 初始速度 ==============
+gen_vel         = yes           ; 从 Maxwell-Boltzmann 分布生成初始速度
+gen_temp        = 298           ; 初始速度温度 (K) - 与 ref_t 一致
+gen_seed        = -1            ; 随机种子 (-1 = 使用系统时间)
+
+; ============== 约束 ==============
+constraints     = h-bonds       ; 约束涉及氢原子的键
+constraint-algorithm = LINCS    ; LINCS 约束算法
+lincs-iter      = 1             ; LINCS 迭代次数
+lincs-order     = 4             ; LINCS 展开阶数
+continuation    = no            ; 新模拟，非续算
+
+; ============== 质心运动移除 ==============
+nstcomm         = 100           ; 质心运动移除频率
+comm-mode       = Linear        ; 移除平动
+comm-grps       = System        ; 整个体系
+

@@ -1,0 +1,127 @@
+; ==============================================================================
+; md_prod.mdp - Production MD (生产段分子动力学) - 生产版
+; ==============================================================================
+; 用途: 正式采样阶段，用于计算统计性质
+;       如: 扩散系数 (MSD)、径向分布函数 (RDF)、密度、结构因子等
+; 版本: Production v1.0
+; 适用: 聚合物/凝胶电解质体系
+;
+; ⭐ 这是最重要的生产 mdp 文件！
+;
+; 默认时长: 10 ns (5,000,000 步 × 2 fs)
+; 默认温度: 298 K
+; 默认压力: 1.0 bar (NPT 生产)
+;
+; 修改总时长只需改 nsteps:
+;   - 10 ns  = 5000000 步
+;   - 20 ns  = 10000000 步
+;   - 50 ns  = 25000000 步
+;   - 100 ns = 50000000 步
+;
+; 输出文件大小估算 (以 10000 原子体系为例):
+;   - xtc 轨迹 (10 ps/帧): ~100 MB / 10 ns
+;   - edr 能量: ~50 MB / 10 ns
+;   - log 日志: ~10 MB / 10 ns
+;
+; ============== 可选修改 ==============
+; 1. 改成 NVT 生产:
+;    pcoupl = no
+;    (不推荐，除非研究特定体积下的性质)
+;
+; 2. 使用 Nose-Hoover 温控 (更严格正则系综):
+;    tcoupl = Nose-Hoover
+;    tau_t = 1.0
+;    (V-rescale 在实践中足够好，且更稳定)
+;
+; 3. 更密集的轨迹输出 (如需精确 MSD):
+;    nstxout-compressed = 2500  ; 5 ps/帧
+;    (会增加文件大小)
+; ==============================================================================
+
+; ============== 运行控制 ==============
+integrator      = md            ; 分子动力学 (牛顿方程)
+dt              = 0.002         ; 时间步长 2 fs (h-bonds 约束下安全)
+nsteps          = 5000000       ; 10 ns (5000000 × 2 fs = 10 ns)
+
+; ============== 输出控制 ==============
+; 生产级输出策略: 平衡分析需求与存储空间
+; 不输出未压缩格式 (太大)
+nstxout         = 0             ; 不输出 trr 坐标
+nstvout         = 0             ; 不输出速度
+nstfout         = 0             ; 不输出力
+
+; 压缩轨迹 (xtc): 主要分析用
+nstxout-compressed = 5000       ; 每 10 ps 输出一帧 (5000 × 2 fs)
+                                ; 适合: RDF、MSD、可视化
+                                ; 如需更精细 MSD，可改为 2500 (5 ps)
+compressed-x-precision = 1000   ; xtc 精度 (默认 1000 = 0.001 nm)
+
+; 能量/日志输出
+nstenergy       = 500           ; 能量每 1 ps (500 × 2 fs)
+nstlog          = 500           ; 日志每 1 ps
+nstcalcenergy   = 100           ; 能量计算频率 (内部)
+
+; ============== 近邻列表 ==============
+cutoff-scheme   = Verlet        ; Verlet 缓冲区方案 (必须)
+nstlist         = 20            ; 邻居列表更新频率 (每 40 fs)
+pbc             = xyz           ; 三维周期性边界条件
+verlet-buffer-tolerance = 0.005 ; 能量漂移容差 (kJ/mol/ps)
+
+; ============== 静电相互作用 (PME) ==============
+coulombtype     = PME           ; Particle Mesh Ewald (长程静电)
+rcoulomb        = 1.2           ; 实空间截断距离 (nm)
+fourierspacing  = 0.12          ; FFT 网格间距 (nm)
+                                ; 较小值更精确但更慢
+pme-order       = 4             ; PME 插值阶数 (cubic)
+
+; ============== 范德华相互作用 ==============
+vdwtype         = Cut-off       ; 截断型 vdW
+vdw-modifier    = Potential-shift  ; 势能平滑截断 (避免截断不连续)
+rvdw            = 1.2           ; vdW 截断距离 (nm)
+DispCorr        = EnerPres      ; 长程色散校正 (能量+压力)
+                                ; 对聚合物体系密度影响显著
+
+; ============== 温度耦合 ==============
+tcoupl          = V-rescale     ; 速度重标定温控
+                                ; 产生正确正则系综，稳定性好
+tc-grps         = System        ; 整个体系一个温控组
+                                ; 如有离子/溶剂分离需求，可分组
+tau_t           = 0.5           ; 时间常数 (ps)
+                                ; 生产阶段建议 0.5-2.0 ps
+ref_t           = 298           ; 目标温度 (K)
+
+; ============== 压力耦合 - Parrinello-Rahman (NPT 生产) ==============
+; Parrinello-Rahman 产生正确的 NPT 系综，适合严格统计
+pcoupl          = Parrinello-Rahman
+pcoupltype      = isotropic     ; 各向同性 (液体/凝胶)
+tau_p           = 5.0           ; 压力耦合时间常数 (ps)
+                                ; P-R 建议 5-10 ps 避免振荡
+ref_p           = 1.0           ; 目标压力 (bar)
+compressibility = 4.5e-5        ; 等温压缩系数 (bar^-1)
+                                ; 4.5e-5 适用于水/有机溶剂
+                                ; 聚合物可调小: 1e-5 ~ 2e-5
+
+; ============== 初始速度 ==============
+gen_vel         = no            ; 生产段从前一步继续，不重新生成
+continuation    = yes           ; 续算模式 (约束不重新初始化)
+
+; ============== 约束 ==============
+constraints     = h-bonds       ; 约束涉及氢原子的键
+                                ; 允许 2 fs 时间步
+constraint-algorithm = LINCS    ; LINCS 算法 (快速、稳定)
+lincs-iter      = 1             ; LINCS 迭代次数
+lincs-order     = 4             ; LINCS 展开阶数
+                                ; 4 阶足够，更高可提高精度但更慢
+
+; ============== 质心运动移除 ==============
+nstcomm         = 100           ; 质心运动移除频率 (步)
+comm-mode       = Linear        ; 移除平动
+comm-grps       = System        ; 整个体系
+
+; ============== 自由能计算 (默认关闭) ==============
+; 如需自由能微扰，取消注释并配置
+; free-energy     = no
+; couple-moltype  =
+; couple-lambda0  = vdw-q
+; couple-lambda1  = none
+

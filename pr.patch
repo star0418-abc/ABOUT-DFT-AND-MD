@@ -1,0 +1,486 @@
+diff --git a/config/recipe.yaml b/config/recipe.yaml
+index bf0408c8c161831fdd51c55daf1f5be822c7b9e4..6d028f8e33640151a269d65b29a5a142610ea986 100644
+--- a/config/recipe.yaml
++++ b/config/recipe.yaml
+@@ -176,50 +176,57 @@ system:
+   name: "gel_electrolyte"
+   
+   # 目标密度 (g/cm³) - 最终由 GROMACS NPT 达成
+   target_density_g_cm3: 1.20
+   
+   # 盒子形状: cubic / rectangular
+   box_shape: "cubic"
+   
+   # 基准质量 (g) - 用于 wt% 换算
+   basis_mass_g: 100.0
+   
+   # 目标总分子数（可选，若指定则覆盖 wt% 换算结果）
+   # target_total_molecules: 500
+ 
+ 
+ # ==============================================================================
+ # Packmol 参数 (packmol)
+ # ==============================================================================
+ packmol:
+   # 公差 (Å)
+   tolerance_A: 2.0
+   
+   # 盒子放大系数 (1.0-2.0)
+   # 推荐: 1.3-1.5 (小分子), 1.5-2.0 (长链聚合物)
+   box_scale: 1.5
++
++  # 若检测到 HTPolyNet 交联网络 + 盐，自动放大 Packmol 盒子以降低填充失败风险
++  auto_box_scale_for_network: true
++  network_box_scale_min: 2.0
++
++  # 将交联网络坐标按 box_scale 等比例放大，以避免“密实网络 + 空腔外填充”的相分离风险
++  scale_network_with_box: true
+   
+   # 随机种子 (-1 随机，正整数可复现)
+   seed: 2025
+   
+   # 输出文件类型
+   filetype: "pdb"
+   output_pdb: "gel.pdb"
+ 
+ 
+ # ==============================================================================
+ # 配方定义
+ # ==============================================================================
+ # 支持三种指定方式（每个组分三选一）:
+ #   - wt_pct:   质量分数 (%)
+ #   - mol_L:    摩尔浓度 (mol/L)
+ #   - count:    直接指定分子数
+ #
+ # 顺序: 盐溶液 → 聚合物基质 → 交联剂 → 光引发剂 → 溶剂
+ # ==============================================================================
+ 
+ # ------------------------------------------------------------------------------
+ # 配方 1: 仅 PEGDA 网络（dry polymer network）
+ # ------------------------------------------------------------------------------
+ # 用法:
+ #   python scripts/build_pegda_network.py --n_monomers 200 --conversion 0.8
+diff --git a/scripts/make_packmol_from_recipe.py b/scripts/make_packmol_from_recipe.py
+index a8c4ffe749449e4731864d7d32053c464b41b29f..f8bb411d91452a8d96ca308b58e87e57668338e6 100644
+--- a/scripts/make_packmol_from_recipe.py
++++ b/scripts/make_packmol_from_recipe.py
+@@ -269,176 +269,222 @@ def parse_grouped(root: Dict[str, Any], cfg_path: Path, project_root: Path) -> T
+                 mw = safe_float(item.get("mw_g_mol", 0.0), 0.0)
+                 charge = safe_float(item.get("charge", 0.0), 0.0)
+                 if cnt <= 0:
+                     continue
+                 structures.append(
+                     Structure(
+                         name=name, pdb_src=pdb, pdb_local=Path(pdb.name),
+                         count=cnt, mw_g_mol=mw, charge=charge, kind="component"
+                     )
+                 )
+ 
+     # --- polymer_matrix
+     if "polymer_matrix" in root and isinstance(root["polymer_matrix"], list):
+         for item in root["polymer_matrix"]:
+             if not isinstance(item, dict):
+                 continue
+             name = str(item.get("name", item.get("id", "polymer")))
+             pdb = resolve_file(str(item.get("file", "")), cfg_path, project_root)
+             cnt = int(item.get("count", 0) or 0)
+             mw = safe_float(item.get("mw_g_mol", 0.0), 0.0)
+             charge = safe_float(item.get("charge", 0.0), 0.0)
+             if cnt <= 0:
+                 continue
+             structures.append(
+                 Structure(name=name, pdb_src=pdb, pdb_local=Path(pdb.name),
+-                          count=cnt, mw_g_mol=mw, charge=charge, kind="component")
++                          count=cnt, mw_g_mol=mw, charge=charge, kind="polymer_matrix")
+             )
+ 
+     # --- crosslinker (optional)
+     if "crosslinker" in root and isinstance(root["crosslinker"], list):
+         for item in root["crosslinker"]:
+             if not isinstance(item, dict):
+                 continue
+             name = str(item.get("name", item.get("id", "crosslinker")))
+             pdb = resolve_file(str(item.get("file", "")), cfg_path, project_root)
+             cnt = int(item.get("count", 0) or 0)
+             mw = safe_float(item.get("mw_g_mol", 0.0), 0.0)
+             charge = safe_float(item.get("charge", 0.0), 0.0)
+             if cnt <= 0:
+                 continue
+             structures.append(
+                 Structure(name=name, pdb_src=pdb, pdb_local=Path(pdb.name),
+-                          count=cnt, mw_g_mol=mw, charge=charge, kind="component")
++                          count=cnt, mw_g_mol=mw, charge=charge, kind="crosslinker")
+             )
+ 
+     # --- photoinitiator (optional)
+     if "photoinitiator" in root and isinstance(root["photoinitiator"], list):
+         for item in root["photoinitiator"]:
+             if not isinstance(item, dict):
+                 continue
+             name = str(item.get("name", item.get("id", "initiator")))
+             pdb = resolve_file(str(item.get("file", "")), cfg_path, project_root)
+             cnt = int(item.get("count", 0) or 0)
+             mw = safe_float(item.get("mw_g_mol", 0.0), 0.0)
+             charge = safe_float(item.get("charge", 0.0), 0.0)
+             if cnt <= 0:
+                 continue
+             structures.append(
+                 Structure(name=name, pdb_src=pdb, pdb_local=Path(pdb.name),
+-                          count=cnt, mw_g_mol=mw, charge=charge, kind="component")
++                          count=cnt, mw_g_mol=mw, charge=charge, kind="photoinitiator")
+             )
+ 
+     return structures, salt_meta
+ 
+ def parse_flat(root: Dict[str, Any], cfg_path: Path, project_root: Path) -> Tuple[List[Structure], Dict[str, Any]]:
+     """
+     Parse flat format:
+       - components: [ {name, file, count, mw_g_mol, charge, type}, ...]
+       - optional salt: {...}  (will be decomposed)
+     """
+     structures: List[Structure] = []
+     salt_meta: Dict[str, Any] = {}
+ 
+     # optional salt dict
+     if "salt" in root and isinstance(root["salt"], dict):
+         salt_structs, meta = parse_salt_from_salt_dict(root["salt"], cfg_path, project_root)
+         structures.extend(salt_structs)
+         salt_meta = meta
+ 
+     # components list
+     comps = root.get("components", None)
+     if not isinstance(comps, list):
+         raise ValueError("Flat format requires 'components' as a list.")
+ 
+     for item in comps:
+         if not isinstance(item, dict):
+             continue
+         itype = str(item.get("type", "component"))
+         if itype == "salt":
+             # allow salt inside components too
+             salt_structs, meta = parse_salt_from_salt_dict(item, cfg_path, project_root)
+             structures.extend(salt_structs)
+             salt_meta = meta
+             continue
+ 
+         name = str(item.get("name", item.get("id", "component")))
+         pdb = resolve_file(str(item.get("file", "")), cfg_path, project_root)
+         cnt = int(item.get("count", 0) or 0)
+         mw = safe_float(item.get("mw_g_mol", 0.0), 0.0)
+         charge = safe_float(item.get("charge", 0.0), 0.0)
+         if cnt <= 0:
+             continue
+         structures.append(
+             Structure(name=name, pdb_src=pdb, pdb_local=Path(pdb.name),
+-                      count=cnt, mw_g_mol=mw, charge=charge, kind="component")
++                      count=cnt, mw_g_mol=mw, charge=charge, kind=itype)
+         )
+ 
+     return structures, salt_meta
+ 
+ def parse_recipe(cfg_path: Path, allow_missing_mw: bool) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any], List[Structure], Dict[str, Any]]:
+     """
+     Return: (root, system_cfg, packmol_cfg, structures, salt_meta)
+     """
+     data = read_yaml(cfg_path)
+     root = get_root_cfg(data)
+ 
+     system_cfg = root.get("system", {}) or {}
+     packmol_cfg = root.get("packmol", {}) or {}
+     constraints = root.get("constraints", {}) or root.get("constraint", {}) or {}
+ 
+     # defaults
+     packmol_cfg.setdefault("tolerance_A", 2.0)
+     packmol_cfg.setdefault("box_scale", 1.5)
++    packmol_cfg.setdefault("auto_box_scale_for_network", False)
++    packmol_cfg.setdefault("network_box_scale_min", 2.0)
++    packmol_cfg.setdefault("scale_network_with_box", False)
+     packmol_cfg.setdefault("seed", 12345)
+     packmol_cfg.setdefault("filetype", "pdb")
+     packmol_cfg.setdefault("output_pdb", "gel.pdb")
+ 
+     # parse structures
+     has_grouped = any(k in root for k in ("salt_solution", "polymer_matrix", "crosslinker", "photoinitiator"))
+     structures: List[Structure] = []
+     salt_meta: Dict[str, Any] = {}
+ 
+     if has_grouped:
+         structures, salt_meta = parse_grouped(root, cfg_path, project_root=cfg_path.parent.parent)
+     else:
+         structures, salt_meta = parse_flat(root, cfg_path, project_root=cfg_path.parent.parent)
+ 
+     if not structures:
+         raise ValueError("No structures parsed (all counts are zero?).")
+ 
+     # MW check
+     if not allow_missing_mw:
+         missing = [s for s in structures if (s.mw_g_mol is None or s.mw_g_mol <= 0)]
+         if missing:
+             msg = "Missing/invalid mw_g_mol for:\n" + "\n".join([f"  - {m.name} ({m.pdb_src})" for m in missing])
+             msg += "\nFix recipe YAML by adding mw_g_mol, or re-run with --allow-missing-mw (not recommended)."
+             raise ValueError(msg)
+ 
+     return root, system_cfg, packmol_cfg, constraints, structures, salt_meta
+ 
+ 
++def has_dense_network(root: Dict[str, Any]) -> bool:
++    polymer_matrix = root.get("polymer_matrix", [])
++    if not isinstance(polymer_matrix, list):
++        return False
++    for item in polymer_matrix:
++        if not isinstance(item, dict):
++            continue
++        source = str(item.get("source", "")).lower()
++        if source == "htpolynet":
++            return True
++        file_path = str(item.get("file", "")).lower()
++        if "htpolynet" in file_path or "htpolynet_out" in file_path:
++            return True
++    return False
++
++
++def maybe_adjust_box_scale(
++    root: Dict[str, Any],
++    packmol_cfg: Dict[str, Any],
++    salt_meta: Dict[str, Any],
++) -> bool:
++    auto_scale = bool(packmol_cfg.get("auto_box_scale_for_network", False))
++    if not auto_scale:
++        return False
++    if not salt_meta:
++        return False
++    if not has_dense_network(root):
++        return False
++
++    box_scale = safe_float(packmol_cfg.get("box_scale", 1.5), 1.5)
++    min_scale = safe_float(packmol_cfg.get("network_box_scale_min", 2.0), 2.0)
++    if box_scale >= min_scale:
++        return False
++
++    packmol_cfg["box_scale"] = min_scale
++    eprint(
++        "[WARN] Detected HTPolyNet-style dense network + salt. "
++        f"Auto-increasing packmol box_scale from {box_scale:.2f} to {min_scale:.2f} "
++        "(set packmol.auto_box_scale_for_network=false to disable)."
++    )
++    return True
++
++
+ # -----------------------------
+ # Box & Packmol I/O
+ # -----------------------------
+ def compute_target_box_from_density(structures: List[Structure], target_density_g_cm3: float) -> BoxInfo:
+     total_mass_g_mol = sum(s.count * float(s.mw_g_mol or 0.0) for s in structures)
+     total_mass_g = total_mass_g_mol / NA
+     volume_cm3 = total_mass_g / target_density_g_cm3
+     L_cm = volume_cm3 ** (1.0 / 3.0)
+     L_A = L_cm * 1e8
+     return BoxInfo(shape="cubic", Lx_A=L_A, Ly_A=L_A, Lz_A=L_A)
+ 
+ def compute_packmol_box(target: BoxInfo, box_scale: float) -> BoxInfo:
+     return BoxInfo(shape=target.shape,
+                    Lx_A=target.Lx_A * box_scale,
+                    Ly_A=target.Ly_A * box_scale,
+                    Lz_A=target.Lz_A * box_scale)
+ 
+ def write_packmol_inp(inp_path: Path, output_pdb: str, tolerance_A: float, seed: int, box: BoxInfo, structures: List[Structure]) -> None:
+     lines: List[str] = []
+     lines.append(f"tolerance {tolerance_A}")
+     lines.append("filetype pdb")
+     lines.append(f"output {output_pdb}")
+     lines.append(f"seed {int(seed)}")
+     lines.append("")  # blank
+ 
+@@ -457,50 +503,122 @@ def write_packmol_inp(inp_path: Path, output_pdb: str, tolerance_A: float, seed:
+ def copy_structures_to_dir(structures: List[Structure], out_dir: Path) -> None:
+     """
+     Copy all pdb_src to out_dir and set pdb_local accordingly (unique names if needed).
+     """
+     used = set()
+     for s in structures:
+         base = slugify(s.pdb_src.stem)
+         ext = s.pdb_src.suffix or ".pdb"
+         # name collisions: add component name prefix if needed
+         preferred = slugify(s.name)
+         fname = f"{preferred}{ext}"
+         if fname in used:
+             fname = f"{preferred}_{base}{ext}"
+         if fname in used:
+             # fallback with numeric suffix
+             k = 2
+             while f"{preferred}_{k}{ext}" in used:
+                 k += 1
+             fname = f"{preferred}_{k}{ext}"
+ 
+         dst = out_dir / fname
+         shutil.copy2(s.pdb_src, dst)
+         used.add(fname)
+         s.pdb_local = dst.name and Path(dst.name)  # store local relative name
+ 
++
++def scale_pdb_coords(path: Path, scale: float) -> bool:
++    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
++    atom_indices: List[int] = []
++    coords: List[Tuple[float, float, float]] = []
++
++    for idx, line in enumerate(lines):
++        if not (line.startswith("ATOM") or line.startswith("HETATM")):
++            continue
++        if len(line) < 54:
++            continue
++        try:
++            x = float(line[30:38])
++            y = float(line[38:46])
++            z = float(line[46:54])
++        except ValueError:
++            continue
++        atom_indices.append(idx)
++        coords.append((x, y, z))
++
++    if not coords:
++        return False
++
++    cx = sum(c[0] for c in coords) / len(coords)
++    cy = sum(c[1] for c in coords) / len(coords)
++    cz = sum(c[2] for c in coords) / len(coords)
++
++    for i, idx in enumerate(atom_indices):
++        x, y, z = coords[i]
++        sx = cx + (x - cx) * scale
++        sy = cy + (y - cy) * scale
++        sz = cz + (z - cz) * scale
++        line = lines[idx]
++        if len(line) < 54:
++            line = line.ljust(54)
++        lines[idx] = f"{line[:30]}{sx:8.3f}{sy:8.3f}{sz:8.3f}{line[54:]}"
++
++    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
++    return True
++
++
++def maybe_scale_network_structures(
++    root: Dict[str, Any],
++    packmol_cfg: Dict[str, Any],
++    structures: List[Structure],
++    packmol_dir: Path,
++) -> bool:
++    if not has_dense_network(root):
++        return False
++    if not bool(packmol_cfg.get("scale_network_with_box", False)):
++        return False
++    scale_factor = safe_float(packmol_cfg.get("box_scale", 1.5), 1.5)
++    if scale_factor <= 1.0:
++        return False
++
++    scaled = False
++    for s in structures:
++        if s.kind != "polymer_matrix":
++            continue
++        pdb_path = packmol_dir / s.pdb_local
++        if not pdb_path.exists():
++            continue
++        if scale_pdb_coords(pdb_path, scale_factor):
++            scaled = True
++
++    if scaled:
++        eprint(
++            "[WARN] Scaled polymer network coordinates by "
++            f"{scale_factor:.2f}x to match packmol box scale."
++        )
++    return scaled
++
+ def run_packmol(packmol_exe: str, inp_path: Path, log_path: Path, cwd: Path, output_pdb: str = "gel.pdb") -> None:
+     """
+     使用 shell 重定向方式运行 Packmol，避免 Fortran 的 'Illegal seek' 错误。
+     
+     关键：不使用 stdin=PIPE 或 input=...，而是用 shell 的 < 重定向，
+     让 Fortran 的 stdin 来自真实文件（可 seek）。
+     """
+     # 使用 shlex.quote 转义路径，避免空格问题
+     cmd_str = (
+         f"{shlex.quote(packmol_exe)} "
+         f"< {shlex.quote(str(inp_path))} "
+         f"> {shlex.quote(str(log_path))} 2>&1"
+     )
+     print(f"[CMD] {cmd_str}")
+     
+     ret = subprocess.call(
+         cmd_str,
+         shell=True,
+         cwd=str(cwd),
+         executable="/bin/bash",
+     )
+     
+     if ret != 0:
+         raise RuntimeError(f"Packmol failed (code={ret}). Check log: {log_path}")
+     
+@@ -617,65 +735,69 @@ def main():
+ 
+     cfg_path = Path(args.config).resolve()
+     if not cfg_path.exists():
+         raise FileNotFoundError(f"Config not found: {cfg_path}")
+ 
+     out_root = Path(args.out).resolve()
+     packmol_dir = out_root / "packmol"
+ 
+     if out_root.exists() and not args.keep:
+         shutil.rmtree(out_root)
+     packmol_dir.mkdir(parents=True, exist_ok=True)
+ 
+     # parse
+     root, system_cfg, packmol_cfg, constraints, structures, salt_meta = parse_recipe(cfg_path, allow_missing_mw=args.allow_missing_mw)
+ 
+     # overrides
+     if args.tolerance is not None:
+         packmol_cfg["tolerance_A"] = float(args.tolerance)
+     if args.box_scale is not None:
+         packmol_cfg["box_scale"] = float(args.box_scale)
+     if args.seed is not None:
+         packmol_cfg["seed"] = int(args.seed)
+     if args.output_pdb is not None:
+         packmol_cfg["output_pdb"] = str(args.output_pdb)
+ 
++    maybe_adjust_box_scale(root, packmol_cfg, salt_meta)
++
+     recipe_name = str(system_cfg.get("name", out_root.name))
+     target_density = safe_float(system_cfg.get("target_density_g_cm3", 1.0), 1.0)
+     box_shape = str(system_cfg.get("box_shape", "cubic"))
+ 
+     if box_shape.lower() != "cubic":
+         raise NotImplementedError("Only cubic box is supported in this script for now.")
+ 
+     # copy pdbs into packmol dir for robust relative paths
+     copy_structures_to_dir(structures, packmol_dir)
+ 
+     # compute boxes
+     target_box = compute_target_box_from_density(structures, target_density_g_cm3=target_density)
+     box_scale = safe_float(packmol_cfg.get("box_scale", 1.5), 1.5)
+     pack_box = compute_packmol_box(target_box, box_scale=box_scale)
+ 
++    maybe_scale_network_structures(root, packmol_cfg, structures, packmol_dir)
++
+     # generate input
+     inp_path = packmol_dir / "gel.inp"
+     output_pdb = str(packmol_cfg.get("output_pdb", "gel.pdb"))
+     tol = safe_float(packmol_cfg.get("tolerance_A", 2.0), 2.0)
+     seed = int(packmol_cfg.get("seed", 12345))
+ 
+     write_packmol_inp(inp_path, output_pdb=output_pdb, tolerance_A=tol, seed=seed, box=pack_box, structures=structures)
+ 
+     # summary
+     summary_path = packmol_dir / "summary.json"
+     write_summary_json(
+         summary_path,
+         recipe_name=recipe_name,
+         system_cfg=system_cfg,
+         packmol_cfg=packmol_cfg,
+         constraints=constraints,
+         target_box=target_box,
+         packmol_box=pack_box,
+         structures=structures,
+         salt_meta=salt_meta,
+         output_pdb=output_pdb,
+     )
+ 
+     print(f"[INFO] Config: {cfg_path}")
+     print(f"[INFO] Output: {out_root}")

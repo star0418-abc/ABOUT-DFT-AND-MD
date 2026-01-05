@@ -1,0 +1,65 @@
+; ==============================================================================
+; npt.mdp - NPT Equilibration (恒温恒压平衡)
+; ==============================================================================
+; 用途: 在恒定温度和压力下平衡密度
+; 来源: gel_packmol smoke pipeline
+; 时长: 200 ps (smoke test，正式模拟建议 2-10 ns)
+;
+; 重要: 这是 Packmol "膨胀盒子" 策略后的关键步骤！
+;       NPT 会将体系压缩到真实密度。
+; ==============================================================================
+
+; 运行控制
+integrator  = md
+dt          = 0.002     ; 时间步长 2 fs
+nsteps      = 100000    ; 200 ps (smoke); 正式模拟可用 1000000+
+
+; 输出控制
+nstxout         = 0
+nstxout-compressed = 5000       ; 压缩轨迹每 10 ps
+nstvout         = 0
+nstfout         = 0
+nstenergy       = 1000
+nstlog          = 1000
+
+; 近邻列表
+cutoff-scheme   = Verlet
+nstlist         = 20
+ns_type         = grid
+pbc             = xyz
+rlist           = 1.2
+
+; 静电
+coulombtype     = PME
+rcoulomb        = 1.2
+fourierspacing  = 0.12
+
+; 范德华
+vdwtype         = Cut-off
+rvdw            = 1.2
+DispCorr        = EnerPres
+
+; 温度耦合
+tcoupl          = V-rescale
+tc-grps         = System
+tau_t           = 0.1
+ref_t           = 300
+
+; 压力耦合
+pcoupl          = Berendsen     ; Berendsen 用于快速压缩 (smoke)
+                                ; 正式采样应改用 Parrinello-Rahman
+pcoupltype      = isotropic     ; 各向同性
+tau_p           = 1.0           ; 压力耦合时间常数 (ps)
+ref_p           = 1.0           ; 目标压力 (bar)
+compressibility = 4.5e-5        ; 等温压缩系数 (bar^-1)
+refcoord-scaling = com          ; 参考坐标缩放
+
+; 初始速度 (从 NVT 继续，不重新生成)
+gen_vel         = no
+continuation    = yes
+
+; 约束
+constraints     = h-bonds
+constraint-algorithm = LINCS
+lincs-order     = 4
+
