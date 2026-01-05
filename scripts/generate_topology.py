@@ -17,7 +17,6 @@ generate_topology.py - 自动生成 GROMACS 拓扑文件
 """
 
 import argparse
-import os
 import shutil
 import subprocess
 import sys
@@ -31,8 +30,66 @@ def parse_recipe(recipe_path: Path) -> dict:
     with open(recipe_path) as f:
         cfg = yaml.safe_load(f)
     
-    recipe = cfg.get('recipe', cfg)
-    components = recipe.get('components', [])
+    components = []
+    missing_counts = []
+    
+    if 'components' in cfg:
+        components = cfg.get('components', [])
+    else:
+        recipe = cfg.get('recipe', {})
+        components = recipe.get('components', [])
+    
+    if not components:
+        for section in ("salt_solution", "polymer_matrix", "crosslinker", "photoinitiator"):
+            entries = cfg.get(section, [])
+            if not isinstance(entries, list):
+                continue
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                if entry.get("type") == "salt":
+                    count = entry.get("count")
+                    if count is None:
+                        missing_counts.append(entry.get("name", entry.get("id", "salt")))
+                        continue
+                    cation = entry.get("cation", {})
+                    anion = entry.get("anion", {})
+                    cation_count = count * int(cation.get("stoichiometry", 1))
+                    anion_count = count * int(anion.get("stoichiometry", 1))
+                    components.append({
+                        "id": f"{entry.get('id', 'salt')}_cation",
+                        "name": cation.get("name", "cation"),
+                        "file": cation.get("file"),
+                        "count": cation_count,
+                        "charge": int(cation.get("charge", 0)),
+                    })
+                    components.append({
+                        "id": f"{entry.get('id', 'salt')}_anion",
+                        "name": anion.get("name", "anion"),
+                        "file": anion.get("file"),
+                        "count": anion_count,
+                        "charge": int(anion.get("charge", 0)),
+                    })
+                    continue
+                
+                if entry.get("count") is None:
+                    missing_counts.append(entry.get("name", entry.get("id", "component")))
+                    continue
+                
+                components.append(entry)
+    
+    if missing_counts:
+        missing_list = ", ".join(missing_counts)
+        raise ValueError(
+            f"以下组分缺少 count: {missing_list}\n"
+            f"请先运行 recipe_to_counts.py 生成包含 count 的 recipe_resolved.yaml"
+        )
+    
+    if not components:
+        raise ValueError(
+            "未找到可用于拓扑生成的 components。\n"
+            "请使用包含 components 列表或已换算 count 的 recipe_resolved.yaml。"
+        )
     
     molecules = {}
     for comp in components:
@@ -114,7 +171,7 @@ def run_acpype(pdb_file: Path, output_dir: Path, mol_name: str, charge: int = 0)
 
 
 def create_simple_itp_for_ion(mol_name: str, pdb_file: Path, charge: int, output_dir: Path) -> Path:
-    """为简单离子创建 itp 文件（不需要 acpype）"""
+    """为简单离子创建 itp 文件（使用 GAFF2 原子类型）"""
     print(f"  [simple] 为离子 {mol_name} 创建简化 itp...")
     
     # 读取 PDB 获取原子信息
@@ -123,8 +180,8 @@ def create_simple_itp_for_ion(mol_name: str, pdb_file: Path, charge: int, output
         for line in f:
             if line.startswith(("ATOM", "HETATM")):
                 atom_name = line[12:16].strip()
-                residue = line[17:20].strip()
-                atoms.append((atom_name, residue))
+                element = line[76:78].strip() if len(line) >= 78 else atom_name[:2].strip()
+                atoms.append((atom_name, element))
     
     if not atoms:
         print(f"  [ERROR] {pdb_file} 中没有原子")
@@ -132,10 +189,56 @@ def create_simple_itp_for_ion(mol_name: str, pdb_file: Path, charge: int, output
     
     itp_path = output_dir / f"{mol_name}.itp"
     
-    # 对于 Li+，使用标准 OPLS-AA 参数
+    gaff_map = {
+        'C': 'c3',
+        'H': 'hc',
+        'O': 'o',
+        'N': 'n3',
+        'S': 's4',
+        'F': 'f',
+        'P': 'p5',
+        'Li': 'Li',
+    }
+    
+    gaff_params = {
+        'c3': (3.39967e-01, 4.57730e-01),
+        'hc': (2.64953e-01, 6.56888e-02),
+        'o': (2.95992e-01, 8.78640e-01),
+        'os': (3.00001e-01, 7.11280e-01),
+        'n3': (3.25000e-01, 7.11280e-01),
+        's4': (3.56359e-01, 1.04600e+00),
+        'f': (3.11815e-01, 2.55224e-01),
+        'p5': (3.74177e-01, 8.36800e-01),
+        'Li': (1.2500e-01, 6.2760e-02),
+    }
+    
+    mass_map = {
+        'C': 12.01, 'H': 1.008, 'O': 16.00, 'N': 14.01,
+        'S': 32.06, 'F': 19.00, 'P': 30.97, 'Li': 6.94,
+    }
+    
+    atomtypes_set = set()
+    atomtypes_lines = []
+    for _, element in atoms:
+        element = element if element else 'C'
+        element = element.capitalize()
+        atype = gaff_map.get(element, 'c3')
+        if atype not in atomtypes_set:
+            atomtypes_set.add(atype)
+            sigma, epsilon = gaff_params.get(atype, (3.4e-01, 4.5e-01))
+            mass = mass_map.get(element, 12.0)
+            atomtypes_lines.append(
+                f"{atype:4s}   {atype:4s}  0.00000  {mass:.3f}   A   {sigma:.5e}  {epsilon:.5e}"
+            )
+    
     if mol_name.upper() == "LI":
         with open(itp_path, 'w') as f:
             f.write(f"; {mol_name} topology (Li+ ion)\n\n")
+            f.write("[ atomtypes ]\n")
+            f.write("; name  bond_type  mass  charge  ptype  sigma  epsilon\n")
+            for line in atomtypes_lines:
+                f.write(f"{line}\n")
+            f.write("\n")
             f.write("[ moleculetype ]\n")
             f.write(f"; name  nrexcl\n")
             f.write(f"{mol_name}  3\n\n")
@@ -146,6 +249,11 @@ def create_simple_itp_for_ion(mol_name: str, pdb_file: Path, charge: int, output
         # 对于其他离子，使用通用模板
         with open(itp_path, 'w') as f:
             f.write(f"; {mol_name} topology\n\n")
+            f.write("[ atomtypes ]\n")
+            f.write("; name  bond_type  mass  charge  ptype  sigma  epsilon\n")
+            for line in atomtypes_lines:
+                f.write(f"{line}\n")
+            f.write("\n")
             f.write("[ moleculetype ]\n")
             f.write(f"; name  nrexcl\n")
             f.write(f"{mol_name}  3\n\n")
@@ -153,30 +261,11 @@ def create_simple_itp_for_ion(mol_name: str, pdb_file: Path, charge: int, output
             f.write(";   nr  type  resnr  residue  atom  cgnr  charge   mass\n")
             
             charge_per_atom = charge / len(atoms) if atoms else 0
-            for i, (atom_name, residue) in enumerate(atoms, 1):
-                # 简单映射原子类型
-                element = atom_name[0]
-                if element == 'C':
-                    atype = 'opls_135'  # 通用 C
-                    mass = 12.01
-                elif element == 'H':
-                    atype = 'opls_140'  # 通用 H
-                    mass = 1.008
-                elif element == 'O':
-                    atype = 'opls_180'  # 通用 O
-                    mass = 16.00
-                elif element == 'N':
-                    atype = 'opls_237'  # 通用 N
-                    mass = 14.01
-                elif element == 'S':
-                    atype = 'opls_222'  # 通用 S
-                    mass = 32.06
-                elif element == 'F':
-                    atype = 'opls_965'  # 通用 F
-                    mass = 19.00
-                else:
-                    atype = f'opls_{100+i}'
-                    mass = 12.0
+            for i, (atom_name, element) in enumerate(atoms, 1):
+                element = element if element else 'C'
+                element = element.capitalize()
+                atype = gaff_map.get(element, 'c3')
+                mass = mass_map.get(element, 12.0)
                 
                 f.write(f"     {i:3d}  {atype:8s}  1  {mol_name:4s}  {atom_name:4s}  {i:3d}  {charge_per_atom:8.4f}  {mass:.2f}\n")
     
@@ -191,9 +280,11 @@ def create_topol_top(molecules: dict, itp_files: dict, output_dir: Path, box_siz
         f.write("; WSGPE Electrolyte Topology\n")
         f.write("; Generated by generate_topology.py\n\n")
         
-        # 力场
-        f.write("; Force field\n")
-        f.write('#include "amber99sb-ildn.ff/forcefield.itp"\n\n')
+        # 力场设置 (GAFF2 与 acpype 输出保持一致)
+        f.write("; Force field: GAFF2 (via acpype-generated itp)\n")
+        f.write("[ defaults ]\n")
+        f.write("; nbfunc  comb-rule  gen-pairs  fudgeLJ  fudgeQQ\n")
+        f.write("1         2          yes        0.5      0.8333\n\n")
         
         # 包含 itp 文件
         f.write("; Molecule topologies\n")
@@ -266,7 +357,11 @@ def main():
     print(f"[INFO] 输出: {output_dir}")
     
     # 解析配方
-    molecules = parse_recipe(config_path)
+    try:
+        molecules = parse_recipe(config_path)
+    except ValueError as exc:
+        print(f"[ERROR] {exc}")
+        return 1
     print(f"[INFO] 找到 {len(molecules)} 种分子")
     
     # 为每个分子生成 itp
@@ -321,4 +416,3 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
-
