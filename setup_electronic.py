@@ -54,6 +54,56 @@ def parse_kpts(kpts_str: str) -> Tuple[int, int, int]:
     return tuple(int(x) for x in parts)
 
 
+def detect_structure_type(atoms) -> Tuple[str, str]:
+    """
+    自动检测结构类型
+    
+    返回: (type, recommended_kpts)
+        type: 'cluster' / 'slab' / 'bulk'
+        recommended_kpts: 推荐的 K 点字符串
+    """
+    if not atoms.pbc.any():
+        # 无 PBC，一定是 cluster
+        return 'cluster', '1 1 1'
+    
+    cell = atoms.get_cell()
+    positions = atoms.get_positions()
+    
+    # 计算每个方向的尺寸和原子分布
+    cell_lengths = cell.lengths()
+    
+    # 检查每个方向的原子分布
+    vacuum_directions = []
+    for axis in range(3):
+        coords = positions[:, axis]
+        span = coords.max() - coords.min()
+        cell_len = cell_lengths[axis]
+        
+        # 如果原子跨度远小于 cell 长度，可能有真空
+        if cell_len > 0 and span / cell_len < 0.6:
+            vacuum_directions.append(axis)
+    
+    if len(vacuum_directions) == 3:
+        # 所有方向都有真空 -> cluster
+        return 'cluster', '1 1 1'
+    elif len(vacuum_directions) == 1:
+        # 一个方向有真空 -> slab
+        axis = vacuum_directions[0]
+        if axis == 2:
+            return 'slab', '8 8 1'
+        elif axis == 1:
+            return 'slab', '8 1 8'
+        else:
+            return 'slab', '1 8 8'
+    elif len(vacuum_directions) == 2:
+        # 两个方向有真空 -> wire/1D
+        # 简化处理为 cluster
+        return 'cluster', '1 1 1'
+    else:
+        # 无明显真空 -> bulk
+        return 'bulk', '12 12 12'
+
+
 def get_common_incar_settings(encut: float, ediff: float, ncore: Optional[int]) -> Dict[str, Any]:
     """
     获取通用 INCAR 设置
@@ -489,6 +539,22 @@ def main():
     except Exception as e:
         print(f"[ERROR] 读取结构失败: {e}")
         sys.exit(1)
+    
+    # 自动检测结构类型
+    print("\n>>> 结构类型检测...")
+    struct_type, recommended_kpts = detect_structure_type(atoms)
+    print(f"    检测到类型: {struct_type}")
+    print(f"    推荐 K 点: {recommended_kpts}")
+    
+    if struct_type == 'cluster':
+        print("\n[INFO] 检测到 cluster 结构，将使用 Gamma-only K 点 (1 1 1)")
+        if args.mode == 'wf':
+            args.kpts_wf = "1 1 1"
+        else:
+            args.kpts_dos = "1 1 1"
+    elif struct_type == 'bulk' and args.mode == 'wf':
+        print("\n[WARN] 检测到 bulk 结构，功函数计算需要 slab + 真空")
+        print("[INFO] 请确保结构是正确的 slab 模型")
     
     # 检查 VASP_PP_PATH
     has_pp, pp_path = check_vasp_pp_path()
