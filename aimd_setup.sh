@@ -72,7 +72,7 @@ if [[ ! -f KPOINTS ]]; then
         echo "[OK] INCAR 中已设置 KSPACING"
     else
         echo "[WARN] INCAR 中未找到 KSPACING，请手动添加或创建 KPOINTS"
-        echo ""
+    echo ""
         echo "建议 Gamma-only KPOINTS 内容:"
         echo "---"
         echo "Automatic mesh"
