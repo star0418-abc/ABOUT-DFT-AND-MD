@@ -254,6 +254,30 @@ def assert_single_fragment(
         raise ConnectivityError("\n".join(debug_info))
 
 
+def find_bonded_c_double_c_pair(mol: Chem.Mol) -> Optional[Tuple[int, int]]:
+    candidates = []
+    for bond in mol.GetBonds():
+        if bond.GetBondType() != Chem.BondType.DOUBLE:
+            continue
+        a = bond.GetBeginAtom()
+        b = bond.GetEndAtom()
+        if a.GetSymbol() != "C" or b.GetSymbol() != "C":
+            continue
+        a_h = a.GetTotalNumHs()
+        b_h = b.GetTotalNumHs()
+        score = abs(a_h - b_h)
+        candidates.append((score, a_h, b_h, a.GetIdx(), b.GetIdx()))
+
+    if not candidates:
+        return None
+
+    candidates.sort(reverse=True)
+    _, a_h, b_h, a_idx, b_idx = candidates[0]
+    if a_h >= b_h:
+        return a_idx, b_idx
+    return b_idx, a_idx
+
+
 def check_connectivity(mol: Chem.Mol, verbose: bool = False) -> Tuple[bool, int]:
     """
     检查分子连通性
@@ -566,7 +590,24 @@ def find_connecting_atoms(
                     if verbose:
                         print(f"    Tail 原子 (EGDA 另一端): {tail_idx + 1}")
                     break
-    
+
+    if head_idx is not None and tail_idx is not None:
+        bond = mol.GetBondBetweenAtoms(head_idx, tail_idx)
+        if bond is None:
+            if verbose:
+                print("    [WARN] Head/Tail 未在同一双键，尝试选择同一 C=C 键")
+            pair = find_bonded_c_double_c_pair(mol)
+            if pair:
+                head_idx, tail_idx = pair
+                if verbose:
+                    print(f"    Head/Tail 修正为同一 C=C: {head_idx + 1}, {tail_idx + 1}")
+    else:
+        pair = find_bonded_c_double_c_pair(mol)
+        if pair:
+            head_idx, tail_idx = pair
+            if verbose:
+                print(f"    Head/Tail 由 C=C 识别: {head_idx + 1}, {tail_idx + 1}")
+
     return head_idx, tail_idx
 
 
@@ -719,6 +760,25 @@ def prepare_monomer_for_polymerization(
     return mol.GetMol()
 
 
+def remove_one_attached_h(
+    mol: Chem.RWMol,
+    atom_idx: int,
+    indices_to_adjust: Optional[List[int]] = None,
+) -> Tuple[int, Optional[List[int]]]:
+    atom = mol.GetAtomWithIdx(atom_idx)
+    h_neighbors = [nbr.GetIdx() for nbr in atom.GetNeighbors() if nbr.GetSymbol() == "H"]
+    if not h_neighbors:
+        return atom_idx, indices_to_adjust
+
+    remove_idx = max(h_neighbors)
+    mol.RemoveAtom(remove_idx)
+    if remove_idx < atom_idx:
+        atom_idx -= 1
+    if indices_to_adjust is not None:
+        indices_to_adjust = [idx - 1 if idx > remove_idx else idx for idx in indices_to_adjust]
+    return atom_idx, indices_to_adjust
+
+
 def polymerize_linear_v2(
     monomer: Chem.Mol,
     head_idx: int,
@@ -816,6 +876,12 @@ def polymerize_linear_v2(
             new_head = head_idx + offset
             new_tail = tail_idx + offset
             
+            # 移除连接原子上的一个氢（避免超价）
+            current_tail, adjust = remove_one_attached_h(polymer, current_tail, [new_head, new_tail])
+            new_head, new_tail = adjust
+            new_head, adjust = remove_one_attached_h(polymer, new_head, [new_tail])
+            new_tail = adjust[0]
+
             # 添加连接键
             polymer.AddBond(current_tail, new_head, Chem.BondType.SINGLE)
             
