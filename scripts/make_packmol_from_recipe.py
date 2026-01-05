@@ -291,7 +291,7 @@ def parse_grouped(root: Dict[str, Any], cfg_path: Path, project_root: Path) -> T
                 continue
             structures.append(
                 Structure(name=name, pdb_src=pdb, pdb_local=Path(pdb.name),
-                          count=cnt, mw_g_mol=mw, charge=charge, kind="component")
+                          count=cnt, mw_g_mol=mw, charge=charge, kind="polymer_matrix")
             )
 
     # --- crosslinker (optional)
@@ -308,7 +308,7 @@ def parse_grouped(root: Dict[str, Any], cfg_path: Path, project_root: Path) -> T
                 continue
             structures.append(
                 Structure(name=name, pdb_src=pdb, pdb_local=Path(pdb.name),
-                          count=cnt, mw_g_mol=mw, charge=charge, kind="component")
+                          count=cnt, mw_g_mol=mw, charge=charge, kind="crosslinker")
             )
 
     # --- photoinitiator (optional)
@@ -325,7 +325,7 @@ def parse_grouped(root: Dict[str, Any], cfg_path: Path, project_root: Path) -> T
                 continue
             structures.append(
                 Structure(name=name, pdb_src=pdb, pdb_local=Path(pdb.name),
-                          count=cnt, mw_g_mol=mw, charge=charge, kind="component")
+                          count=cnt, mw_g_mol=mw, charge=charge, kind="photoinitiator")
             )
 
     return structures, salt_meta
@@ -370,7 +370,7 @@ def parse_flat(root: Dict[str, Any], cfg_path: Path, project_root: Path) -> Tupl
             continue
         structures.append(
             Structure(name=name, pdb_src=pdb, pdb_local=Path(pdb.name),
-                      count=cnt, mw_g_mol=mw, charge=charge, kind="component")
+                      count=cnt, mw_g_mol=mw, charge=charge, kind=itype)
         )
 
     return structures, salt_meta
@@ -391,6 +391,7 @@ def parse_recipe(cfg_path: Path, allow_missing_mw: bool) -> Tuple[Dict[str, Any]
     packmol_cfg.setdefault("box_scale", 1.5)
     packmol_cfg.setdefault("auto_box_scale_for_network", False)
     packmol_cfg.setdefault("network_box_scale_min", 2.0)
+    packmol_cfg.setdefault("scale_network_with_box", False)
     packmol_cfg.setdefault("seed", 12345)
     packmol_cfg.setdefault("filetype", "pdb")
     packmol_cfg.setdefault("output_pdb", "gel.pdb")
@@ -523,6 +524,78 @@ def copy_structures_to_dir(structures: List[Structure], out_dir: Path) -> None:
         shutil.copy2(s.pdb_src, dst)
         used.add(fname)
         s.pdb_local = dst.name and Path(dst.name)  # store local relative name
+
+
+def scale_pdb_coords(path: Path, scale: float) -> bool:
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    atom_indices: List[int] = []
+    coords: List[Tuple[float, float, float]] = []
+
+    for idx, line in enumerate(lines):
+        if not (line.startswith("ATOM") or line.startswith("HETATM")):
+            continue
+        if len(line) < 54:
+            continue
+        try:
+            x = float(line[30:38])
+            y = float(line[38:46])
+            z = float(line[46:54])
+        except ValueError:
+            continue
+        atom_indices.append(idx)
+        coords.append((x, y, z))
+
+    if not coords:
+        return False
+
+    cx = sum(c[0] for c in coords) / len(coords)
+    cy = sum(c[1] for c in coords) / len(coords)
+    cz = sum(c[2] for c in coords) / len(coords)
+
+    for i, idx in enumerate(atom_indices):
+        x, y, z = coords[i]
+        sx = cx + (x - cx) * scale
+        sy = cy + (y - cy) * scale
+        sz = cz + (z - cz) * scale
+        line = lines[idx]
+        if len(line) < 54:
+            line = line.ljust(54)
+        lines[idx] = f"{line[:30]}{sx:8.3f}{sy:8.3f}{sz:8.3f}{line[54:]}"
+
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return True
+
+
+def maybe_scale_network_structures(
+    root: Dict[str, Any],
+    packmol_cfg: Dict[str, Any],
+    structures: List[Structure],
+    packmol_dir: Path,
+) -> bool:
+    if not has_dense_network(root):
+        return False
+    if not bool(packmol_cfg.get("scale_network_with_box", False)):
+        return False
+    scale_factor = safe_float(packmol_cfg.get("box_scale", 1.5), 1.5)
+    if scale_factor <= 1.0:
+        return False
+
+    scaled = False
+    for s in structures:
+        if s.kind != "polymer_matrix":
+            continue
+        pdb_path = packmol_dir / s.pdb_local
+        if not pdb_path.exists():
+            continue
+        if scale_pdb_coords(pdb_path, scale_factor):
+            scaled = True
+
+    if scaled:
+        eprint(
+            "[WARN] Scaled polymer network coordinates by "
+            f"{scale_factor:.2f}x to match packmol box scale."
+        )
+    return scaled
 
 def run_packmol(packmol_exe: str, inp_path: Path, log_path: Path, cwd: Path, output_pdb: str = "gel.pdb") -> None:
     """
@@ -700,6 +773,8 @@ def main():
     target_box = compute_target_box_from_density(structures, target_density_g_cm3=target_density)
     box_scale = safe_float(packmol_cfg.get("box_scale", 1.5), 1.5)
     pack_box = compute_packmol_box(target_box, box_scale=box_scale)
+
+    maybe_scale_network_structures(root, packmol_cfg, structures, packmol_dir)
 
     # generate input
     inp_path = packmol_dir / "gel.inp"

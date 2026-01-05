@@ -202,6 +202,9 @@ packmol:
   # 若检测到 HTPolyNet 交联网络 + 盐，自动放大 Packmol 盒子以降低填充失败风险
   auto_box_scale_for_network: true
   network_box_scale_min: 2.0
+
+  # 将交联网络坐标按 box_scale 等比例放大，以避免“密实网络 + 空腔外填充”的相分离风险
+  scale_network_with_box: true
   
   # 随机种子 (-1 随机，正整数可复现)
   seed: 2025
