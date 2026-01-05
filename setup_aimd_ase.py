@@ -680,8 +680,23 @@ def neutralize_by_residue(
     info = []
     
     if resnames is not None and resids is not None and HAS_UTILS:
-        # 按残基中和
+        # 确保选中集合不包含残基的“半截”
         selected_set = set(selected_indices)
+        residue_groups: Dict[Tuple[str, int], Set[int]] = {}
+        for idx, (resname, resid) in enumerate(zip(resnames, resids)):
+            residue_groups.setdefault((resname, resid), set()).add(idx)
+
+        expanded_selected = set()
+        for (resname, resid), indices in residue_groups.items():
+            if indices & selected_set:
+                expanded_selected.update(indices)
+
+        if expanded_selected != selected_set:
+            selected_set = expanded_selected
+            selected_indices = np.array(sorted(selected_set))
+            info.append("[INFO] 已将选中集合扩展为完整残基，避免部分残基参与中和")
+
+        # 按残基中和
         counterion_groups, remaining = find_counterion_residues(
             resnames, resids, selected_set,
             current_charge, target_charge,

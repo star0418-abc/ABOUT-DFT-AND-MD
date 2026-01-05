@@ -259,44 +259,37 @@ def find_counterion_residues(
     else:
         return [], 0
     
-    # 以残基为单位建立完整映射，确保加入时是完整残基
-    residues: Dict[Tuple[str, int], Set[int]] = {}
-    for atom_idx in range(len(residue_names)):
-        resname = residue_names[atom_idx].upper().strip()
-        resid = residue_indices[atom_idx] if atom_idx < len(residue_indices) else 0
-        key = (resname, resid)
-        residues.setdefault(key, set()).add(atom_idx)
-
-    # 找出完整且未被选中的目标残基
+    # 找出所有不在选中集合中的目标残基
     available: Dict[Tuple[str, int], Dict] = {}  # (resname, resid) -> {indices, charge, min_dist}
-    for (resname, resid), indices in residues.items():
+    
+    for atom_idx in range(len(residue_names)):
+        if atom_idx in selected_atom_indices:
+            continue
+        
+        resname = residue_names[atom_idx].upper().strip()
         if resname not in target_residues:
             continue
-        if indices & selected_atom_indices:
-            continue
-
-        charge = res_map.get(resname, 0)
-        if abs(charge) == 0:
-            continue
-
-        available[(resname, resid)] = {
-            'indices': set(indices),
-            'charge': charge,
-            'min_dist': float('inf'),
-        }
-
-        for atom_idx in indices:
-            # 计算到中心的距离
-            d = positions[atom_idx] - center_position
-            if cell is not None:
-                cell_inv = np.linalg.inv(cell)
-                d_frac = np.dot(d, cell_inv)
-                d_frac -= np.round(d_frac)
-                d = np.dot(d_frac, cell)
-            dist = np.linalg.norm(d)
-            available[(resname, resid)]['min_dist'] = min(
-                available[(resname, resid)]['min_dist'], dist
-            )
+        
+        resid = residue_indices[atom_idx] if atom_idx < len(residue_indices) else 0
+        key = (resname, resid)
+        
+        if key not in available:
+            charge = res_map.get(resname, 0)
+            if abs(charge) == 0:
+                continue
+            available[key] = {'indices': set(), 'charge': charge, 'min_dist': float('inf')}
+        
+        available[key]['indices'].add(atom_idx)
+        
+        # 计算到中心的距离
+        d = positions[atom_idx] - center_position
+        if cell is not None:
+            cell_inv = np.linalg.inv(cell)
+            d_frac = np.dot(d, cell_inv)
+            d_frac -= np.round(d_frac)
+            d = np.dot(d_frac, cell)
+        dist = np.linalg.norm(d)
+        available[key]['min_dist'] = min(available[key]['min_dist'], dist)
     
     # 按距离排序
     sorted_residues = sorted(available.items(), key=lambda x: x[1]['min_dist'])
@@ -312,3 +305,4 @@ def find_counterion_residues(
         remaining -= abs(info['charge'])
     
     return counterion_atoms, remaining
+
