@@ -419,8 +419,17 @@ run_htpolynet_phase() {
     # 生成 EGDA active form
     info "生成 EGDA active form..."
     
-    local egda_mol="${PROJECT_ROOT}/mol/EGDA.mol"
+    local egda_mol
+    local htpolynet_workdir
     local active_mol2="${htpolynet_dir}/EGDA_active.mol2"
+    local pegda_mol2="${htpolynet_dir}/PEGDA.mol2"
+
+    egda_mol=$(grep -A10 "^htpolynet:" "$RECIPE_FILE" | grep "source:" | head -1 | awk '{print $2}' | sed 's/"//g' || true)
+    htpolynet_workdir=$(grep -A10 "^htpolynet:" "$RECIPE_FILE" | grep "workdir:" | head -1 | awk '{print $2}' | sed 's/"//g' || true)
+    egda_mol="${egda_mol:-mol/EGDA.mol}"
+    htpolynet_workdir="${htpolynet_workdir:-htpolynet_out/PEGDA}"
+    egda_mol="${PROJECT_ROOT}/${egda_mol}"
+    htpolynet_workdir="${PROJECT_ROOT}/${htpolynet_workdir}"
     
     if [[ ! -f "$egda_mol" ]]; then
         error "EGDA 单体文件不存在: $egda_mol"
@@ -511,19 +520,43 @@ with open(active_mol2_path, 'w') as f:
     f.write('@<TRIPOS>SUBSTRUCTURE\n     1 EGD         1 RESIDUE    0 **** **** 0 ROOT\n')
 
 print(f'Active form 已生成: {active_mol2_path}')
-
-# 转换为 PDB
-mol2 = Chem.MolFromMol2File(active_mol2_path, removeHs=False)
-if mol2:
-    Chem.MolToPDBFile(mol2, '${network_pdb}')
-    print(f'network.pdb 已生成: ${network_pdb}')
 PYTHON_SCRIPT
-    
+
+    info "运行 HTPolyNet 主流程..."
+    if "$PYTHON" "${SCRIPT_DIR}/build_pegda_network.py" \
+        --in_mol "${egda_mol#${PROJECT_ROOT}/}" \
+        --out_mol2 "${pegda_mol2#${PROJECT_ROOT}/}" \
+        --workdir "${htpolynet_workdir#${PROJECT_ROOT}/}" \
+        --n_monomers "$n_monomers" \
+        --conversion "$conversion" \
+        --seed "$seed" 2>&1 | tee -a "$LOG_FILE"; then
+        info "HTPolyNet 已运行"
+    else
+        warn "HTPolyNet 运行失败，尝试回退到 active form"
+    fi
+
+    local htpolynet_pdb=""
+    htpolynet_pdb=$(find "$htpolynet_workdir" -type f -name "*.pdb" 2>/dev/null | head -1 || true)
+    if [[ -n "$htpolynet_pdb" ]]; then
+        cp "$htpolynet_pdb" "$network_pdb"
+        success "Phase 2 完成: 交联网络已生成"
+        return 0
+    fi
+
+    if [[ -f "$pegda_mol2" ]]; then
+        "$PYTHON" - << PYTHON_SCRIPT 2>&1 | tee -a "$LOG_FILE"
+from rdkit import Chem
+mol = Chem.MolFromMol2File("${pegda_mol2}", removeHs=False)
+if mol:
+    Chem.MolToPDBFile(mol, "${network_pdb}")
+    print("network.pdb 已生成: ${network_pdb}")
+PYTHON_SCRIPT
+    fi
+
     if [[ -f "$network_pdb" ]]; then
         success "Phase 2 完成: 交联网络已生成"
     else
-        warn "HTPolyNet 生成简化网络"
-        # 创建简化网络
+        warn "HTPolyNet 输出不可用，生成简化网络"
         if [[ -f "$active_mol2" ]]; then
             "$PYTHON" -c "
 from rdkit import Chem
@@ -574,9 +607,30 @@ def read_atoms(path):
                 lines.append(line.rstrip("\n"))
     return lines
 
-atoms = read_atoms(packmol) + read_atoms(network)
+def parse_coords(line):
+    return float(line[30:38]), float(line[38:46]), float(line[46:54])
+
+packmol_atoms = read_atoms(packmol)
+network_atoms = read_atoms(network)
+atoms = packmol_atoms + network_atoms
 if not atoms:
     raise SystemExit("ERROR: 未找到可合并的 ATOM/HETATM 行")
+
+if packmol_atoms and network_atoms:
+    coords = [parse_coords(line) for line in packmol_atoms]
+    min_x = min(c[0] for c in coords)
+    max_x = max(c[0] for c in coords)
+    padding = 5.0
+    dx = (max_x - min_x) + padding
+
+    shifted = []
+    for line in network_atoms:
+        x, y, z = parse_coords(line)
+        new_x = x + dx
+        shifted.append(f"{line[:30]}{new_x:8.3f}{y:8.3f}{z:8.3f}{line[54:]}")
+    network_atoms = shifted
+
+atoms = packmol_atoms + network_atoms
 
 renumbered = []
 for idx, line in enumerate(atoms, start=1):
@@ -708,7 +762,7 @@ run_coordination_phase() {
             warn "gmx 不可用，无法生成 index.ndx"
             return 0
         fi
-        if echo -e "r LI\nr O\nq\n" | gmx make_ndx -f "$tpr_file" -o "${gmx_dir}/index.ndx" 2>&1 | tee -a "$LOG_FILE"; then
+        if echo -e "r LI\na O*\nq\n" | gmx make_ndx -f "$tpr_file" -o "${gmx_dir}/index.ndx" 2>&1 | tee -a "$LOG_FILE"; then
             info "已生成 index.ndx"
         else
             warn "自动生成 index.ndx 失败，请手动创建包含 LI 与 O 组的索引文件"
@@ -721,7 +775,7 @@ cursor-sync
     fi
 
     info "使用 gmx rdf 计算配位数..."
-    if echo -e "LI\nO\n" | gmx rdf -f "$traj_file" -s "$tpr_file" -n "${gmx_dir}/index.ndx" -o rdf_Li_O.xvg -cn cn_Li_O.xvg 2>&1 | tee -a "$LOG_FILE"; then
+    if echo -e "LI\nO*\n" | gmx rdf -f "$traj_file" -s "$tpr_file" -n "${gmx_dir}/index.ndx" -o rdf_Li_O.xvg -cn cn_Li_O.xvg 2>&1 | tee -a "$LOG_FILE"; then
         local cn_value
         cn_value=$(awk '($1>=0.35){print $2; exit}' cn_Li_O.xvg 2>/dev/null || true)
         cat > coordination_summary.txt << EOF
