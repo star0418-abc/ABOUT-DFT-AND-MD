@@ -13,7 +13,7 @@
 #   STRICT_NP    - 严格核数: 1=NP 超限时报错退出 (默认 0=自动下调)
 #   RESERVE_CORES - WSL 预留核数 (默认 2)
 #   MIN_FREE_GB  - 最小磁盘空间 GB (默认 20)
-#   FORCE_DISK   - 忽略磁盘检查: 1=强制继续 (默认 0)
+#   FORCE_DISK   - 忽略磁盘检查: 1=强制继续 (默认 0, 磁盘检查默认启用)
 # ============================================================================
 set -uo pipefail  # 不用 -e，手动捕获 mpirun 返回码
 
@@ -33,7 +33,7 @@ RESUME="${RESUME:-0}"
 STRICT_NP="${STRICT_NP:-0}"
 RESERVE_CORES="${RESERVE_CORES:-2}"
 MIN_FREE_GB="${MIN_FREE_GB:-20}"
-FORCE_DISK="${FORCE_DISK:-0}"
+FORCE_DISK="${FORCE_DISK:-0}"  # 默认启用磁盘检查
 TIMESTAMP="$(date '+%Y%m%d_%H%M%S')"
 
 # ---------------------- 函数：记录到 run.log ----------------------
