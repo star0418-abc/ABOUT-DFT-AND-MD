@@ -2,6 +2,59 @@
 
 针对 VASP (oneAPI + Intel MPI) 环境的计算辅助脚本集合，适用于凝胶电解质、AIMD 等计算任务。
 
+---
+
+## ⚠️ 使用边界（Scope）
+
+> **在开始使用前，请理解 DFT-AIMD 的适用范围**
+
+| 性质 | 推荐方法 | 说明 |
+|------|----------|------|
+| **输运性质（D, σ）** | 经典 MD (ns 级) | AIMD 时间尺度太短 (ps)，扩散系数仅供趋势参考 |
+| **局域结构/配位** | DFT-AIMD | AIMD 优势：电子结构精确 |
+| **反应趋势/过渡态** | DFT-AIMD / NEB | 反应能垒、过渡态搜索 |
+| **电化学稳定窗口 (ESW)** | 片段氧化/还原能 | PBE 带隙不能直接当 ESW！ |
+| **长程扩散 (ns 级)** | 经典 MD | AIMD 不适用 |
+
+### 模型类型说明
+
+- **bulk 模式**：周期性子胞，适合局域性质分析
+- **cluster 模式**：有限真空簇，**不能用于 bulk 性质**，表面效应显著
+
+---
+
+## 🚨 常见陷阱（必读）
+
+### 1. Cluster Trap（真空簇误用）
+❌ **错误**：用 cluster 模式计算扩散系数并与 bulk 比较  
+✅ **正确**：cluster 仅用于局域电子结构分析；扩散用 bulk 模式或经典 MD
+
+### 2. False Diffusion Trap（伪扩散）
+❌ **错误**：AIMD 几 ps 直接用 r(t)-r(0) 拟合 MSD 得到 D  
+✅ **正确**：使用 `aimd_msd.py` v2.2（默认 MTO）：
+  - Multiple Time Origins (MTO): 对每个 lag τ 平均所有起点
+  - 检查 log-log 斜率 α ≈ 1（正常扩散）
+  - 检查 D(t) 平台稳定
+  - α < 0.8 表示亚扩散/caging，D 不可信
+
+### 6. Bulk Density Trap（bulk 密度失控）
+❌ **错误**：用 bounding box + buffer 定 bulk 子胞盒子 → 密度远低于凝胶  
+✅ **正确**：`setup_aimd_ase.py` v2.2 按原体系密度反推 V = M_sub / ρ_orig
+
+### 3. Langevin Gamma Trap（热浴干扰）
+❌ **错误**：gamma=20 跑全程，扩散被抑制  
+✅ **正确**：平衡段 gamma=10-20，生产段 gamma=1-5
+
+### 4. Band Gap ≠ ESW Trap（带隙误用）
+❌ **错误**：PBE 带隙 = 电化学稳定窗口  
+✅ **正确**：ESW 需要片段氧化/还原能或反应自由能分析
+
+### 5. Recipe Rounding Trap（凑整误差）
+❌ **错误**：200 原子体系严格保持 wt%  
+✅ **正确**：检查 counts_report.txt 误差；增大 target_atoms 减小误差
+
+---
+
 ## 文件列表
 
 | 文件 | 用途 |
@@ -10,7 +63,7 @@
 | `run_vasp.sh` | VASP 运行脚本（备份、日志、续算、核数检查） |
 | `check_vasp.sh` | 检查计算状态（完成标志、能量、费米能级） |
 | `aimd_watch.sh` | AIMD 实时监控（温度、离子步、能量） |
-| `aimd_msd.py` | MSD 计算与扩散系数拟合（需要 numpy） |
+| `aimd_msd.py` | MSD 计算与扩散系数拟合 v2.2（MTO + α 判定 + 分段误差） |
 | `aimd_post.py` | AIMD 热力学数据后处理（E0、T、F 导出 CSV） |
 | `clean_vasp.sh` | 安全清理大文件（WAVECAR、CHGCAR 等） |
 | `recipe.yaml` | 配方定义文件示例（8 类组分 + 模拟条件） |
@@ -20,7 +73,9 @@
 | `aimd_setup.sh` | AIMD 一键设置脚本 |
 | `setup_electronic.py` | 电子性质输入生成（功函数/DOS） |
 | `analyze_electronic.py` | 电子性质后处理（功函数/DOS） |
-| `setup_aimd_ase.py` | 从大体系切割 AIMD cluster |
+| `setup_aimd_ase.py` | 从大体系切割 AIMD 子体系 v2.2（密度定盒 + 残基电荷） |
+| `smoke_test.sh` | 功能验证脚本 |
+| `examples/` | 示例文件目录 |
 
 ## 快速开始
 
@@ -36,6 +91,12 @@ source ~/.bashrc
 
 ```bash
 pip install numpy pyyaml ase matplotlib
+```
+
+### 3. 功能验证
+
+```bash
+./smoke_test.sh
 ```
 
 ---
@@ -194,26 +255,48 @@ functional_filler: []
 
 ---
 
-## 从大体系切割 AIMD Cluster（ASE）
+## 从大体系切割 AIMD 子体系（ASE）
 
 ### 概述
 
 `setup_aimd_ase.py` 用于从大体系结构（GROMACS/Packmol 输出）中切割出一个可用于 VASP AIMD 的局部量子区域。
 
-**典型场景**：凝胶电解质体系有数千原子，AIMD 只能算几百原子，需要切割一个以目标离子为中心的小 cluster。
+**v2.2 关键改进**：
+- ✅ **按密度定盒子**：bulk 模式用 V = M_sub / ρ_orig（避免"低压气相"陷阱）
+- ✅ **MIC 重成像**：选中原子按 MIC 位移重建坐标，保证空间连贯
+- ✅ **残基电荷估计**：支持 TFSI（双三氟甲磺酰亚胺）等多原子离子
+- ✅ **切断键检测**：警告可能的自由基/断链
+- ✅ **键跳扩展**：`--bond_hops` 避免切断聚合物链
+- ✅ **密度 meta**：输出 `density_original/target/achieved`
+
+**物理原理**：
+```
+Bulk 盒子体积:
+  V_target = M_sub / ρ_target
+  
+  其中 ρ_target 默认取原体系密度 ρ_orig
+  这保证了子体系密度与原体系一致，物理合理
+
+错误做法（旧版）:
+  V = bbox + buffer  →  密度远低于实际，产生"低压气相"
+```
+
+**典型场景**：凝胶电解质体系有数千原子，AIMD 只能算几百原子，需要切割一个以目标离子为中心的小子体系。
 
 ### 基本用法
 
 ```bash
-# 以 Li 原子为中心，半径 8 Å，温度 350 K
-python3 setup_aimd_ase.py --src equilibrated.pdb --center_atom Li --radius 8 --temp 350 --outdir aimd_Li8A
+# bulk 模式（默认，周期性子胞，推荐用于凝胶电解质）
+python3 setup_aimd_ase.py --src equilibrated.pdb --center_atom Li --radius 8 --mode bulk --outdir aimd_bulk
 
-# 使用原子索引（0-based）
-python3 setup_aimd_ase.py --src equilibrated.pdb --center_atom 100 --radius 10 --outdir aimd_idx100
+# cluster 模式（真空簇，需显式指定）
+python3 setup_aimd_ase.py --src equilibrated.pdb --center_atom Li --radius 8 --mode cluster --vacuum 20 --outdir aimd_cluster
 
-# 保留完整分子（避免切断分子）
-python3 setup_aimd_ase.py --src system.pdb --center_atom Li --radius 8 --selection molecule --outdir aimd_mol
+# 保留完整分子 + 电荷中和
+python3 setup_aimd_ase.py --src system.pdb --center_atom Li --radius 8 --selection molecule --neutralize nearest_counterions --outdir aimd_mol
 ```
+
+> ⚠️ **重要**：默认为 bulk 模式。cluster 模式必须显式指定 `--mode cluster`。
 
 ### 参数说明
 
@@ -221,17 +304,22 @@ python3 setup_aimd_ase.py --src system.pdb --center_atom Li --radius 8 --selecti
 |------|--------|------|
 | `--src` | 必填 | 输入结构文件（.pdb/.gro/.xyz/.cif） |
 | `--center_atom` | 必填 | 中心原子（索引或元素符号如 Li） |
+| `--mode` | bulk | 模式: bulk（周期性）/ cluster（真空簇） |
 | `--radius` | 8.0 | 切割半径 Å |
 | `--selection` | sphere | 选择模式: sphere / molecule |
-| `--vacuum` | 20 | 真空层厚度 Å |
+| `--bond_hops` | 0 | 键跳扩展步数（避免切断聚合物链） |
+| `--density_g_cm3` | 原体系 | 目标密度 g/cm³（bulk 模式） |
+| `--cell_shape` | scale_parent | 盒子形状: scale_parent / cubic |
+| `--vacuum` | 20 | 真空层厚度 Å（仅 cluster 模式） |
+| `--neutralize` | none | 电荷中和: none / nearest_counterions |
+| `--charge_map_file` | - | 自定义残基电荷映射文件 |
+| `--thermostat` | langevin | 恒温器: langevin / nose |
+| `--gamma_1ps` | 10 | Langevin gamma (1/ps) |
+| `--max_atoms` | 400 | 最大原子数限制 |
 | `--temp` | 350 | AIMD 温度 K |
 | `--steps` | 2000 | AIMD 步数 |
-| `--potim` | 2.0 | 时间步长 fs（含 H 建议 0.5-1.0） |
-| `--kpoints` | "1 1 1" | K 点网格（Gamma-only） |
-| `--ncore` | - | NCORE 并行参数 |
-| `--outdir` | aimd_cluster | 输出目录 |
-| `--overwrite` | False | 覆盖已存在目录 |
-| `--one_based` | False | 原子索引按 1-based 解释 |
+| `--potim` | 1.0 | 时间步长 fs（含 H 建议 0.5-1.0） |
+| `--outdir` | aimd_sub | 输出目录 |
 
 ### 选择模式
 
@@ -244,12 +332,28 @@ python3 setup_aimd_ase.py --src system.pdb --center_atom Li --radius 8 --selecti
 
 ```
 aimd_Li8A/
-├── POSCAR              # VASP 结构文件
-├── INCAR               # AIMD 参数
-├── KPOINTS             # K 点（Gamma-only）
-├── POTCAR              # 赝势（如 VASP_PP_PATH 已设置）
-├── cluster_visual.xyz  # 可视化文件（OVITO/VMD）
-└── selected_indices.txt # 选中的原子索引
+├── POSCAR               # VASP 结构文件
+├── INCAR                # AIMD 参数
+├── KPOINTS              # K 点（Gamma-only）
+├── POTCAR               # 赝势（如 VASP_PP_PATH 已设置）
+├── cluster_visual.xyz   # 可视化文件（OVITO/VMD）
+├── model_meta.json      # 元数据（含 density_*, 电荷, 警告）
+├── selected_indices.txt # 选中的原子索引
+└── cut_bonds_report.txt # 切断键报告（若有）
+```
+
+**model_meta.json 关键字段**:
+```json
+{
+  "density": {
+    "original_g_cm3": 1.18,
+    "target_g_cm3": 1.18,
+    "achieved_g_cm3": 1.17
+  },
+  "estimated_charge": 0,
+  "cut_bonds": { "count": 0 },
+  "warnings": []
+}
 ```
 
 ### 电荷检查
@@ -329,8 +433,89 @@ RESUME=1 NP=16 run_vasp.sh
 
 # 7. 后处理
 python3 aimd_post.py
-python3 aimd_msd.py --specie Li --dt_fs 1.0
+python3 aimd_msd.py --specie Li --dt_fs 1.0 --t_skip_ps 2.0
 ```
+
+### MSD 分析 (v2.2)
+
+```bash
+# 基本用法（默认 MTO）
+python3 aimd_msd.py --specie Li --dt_fs 1.0
+
+# 快速模式（stride=2 降低计算量）
+python3 aimd_msd.py --specie Li --dt_fs 1.0 --stride 2
+
+# 旧版兼容模式（单一时间原点，仅用于对比）
+python3 aimd_msd.py --specie Li --dt_fs 1.0 --msd_method single_origin
+
+# 指定拟合区间
+python3 aimd_msd.py --specie Li --dt_fs 1.0 --t_skip_ps 2.0 --t_fit_start_ps 5.0
+
+# 分段独立误差估计
+python3 aimd_msd.py --specie Li --dt_fs 1.0 --n_blocks 4
+
+# 关闭 unwrap 一致性检查（不推荐）
+python3 aimd_msd.py --specie Li --dt_fs 1.0 --no_unwrap_check
+```
+
+**输出文件**：
+- `msd_Li.dat`: MSD 数据（lag_ps, MSD_A2, n_samples）
+- `D_running_Li.dat`: Running-D（D_ratio + D_deriv）
+- `alpha_Li.dat`: log-log 斜率 α(t)
+- `msd_report.txt`: 完整分析报告
+
+**物理原理**：
+```
+MTO MSD 公式:
+  MSD(τ) = ⟨|r(t₀+τ) - r(t₀)|²⟩_{t₀,ions}
+  
+  对每个 lag τ，平均所有时间起点 t₀ 和目标离子
+
+α(t) 判定:
+  α = d log(MSD) / d log(t)
+  
+  α ≈ 1: 正常扩散 (Fickian)
+  α < 1: 亚扩散/受限 (caging, network constraint)
+  α > 1: 超扩散/弹道 (early ballistic)
+  
+  只有 α ≈ 1 且 D(t) 平稳时，扩散系数才可信
+```
+
+**v2.2 关键改进**：
+
+| 功能 | v2.1 | v2.2 |
+|------|------|------|
+| MTO | ✓ | ✓ + 智能 max_lag 默认 |
+| 误差估计 | trajectory blocks | + 正确说明物理意义 |
+| 计算效率 | - | **--stride 控制** |
+| Unwrap | 跳变检测 | **+ |d|>0.5 一致性检查** |
+| Vacuum 检测 | - | **自动识别 cluster** |
+
+**新增/更新参数**：
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--msd_method` | mto | mto / single_origin |
+| `--stride` | 1 | MTO lag 步进（2/5 可降低计算量） |
+| `--max_lag_ps` | min(T×0.5, 10) | 智能默认，避免噪声 |
+| `--unwrap_check` | 启用 | 检测 |d|>0.5 分数坐标跳跃 |
+| `--remove_com` | all | COM 漂移去除 |
+| `--runningD` | both | ratio/derivative/both |
+| `--alpha_window` | 21 | α(t) 滑窗大小 |
+| `--block_mode` | trajectory_blocks | trajectory_blocks/bootstrap |
+| `--seed` | - | Bootstrap 随机种子 |
+
+**log-log 斜率 α(t) 解释**：
+
+| α 值 | 状态 | 含义 |
+|------|------|------|
+| α ≈ 1 | diffusive | 正常扩散 |
+| α < 0.8 | subdiffusive | 受限/亚扩散（caging） |
+| α > 1.2 | superdiffusive | 弹道/超扩散（早期或漂移） |
+
+> ⚠️ **重要**：只有 α ≈ 1 且 D(t) 稳定时，扩散系数才可信
+> 
+> ⚠️ 若检测到亚扩散（α < 0.8），说明 AIMD 时间内原子运动受限，扩散系数可能被高估
 
 ### make_incar_aimd.py 功能
 
@@ -340,6 +525,30 @@ python3 aimd_msd.py --specie Li --dt_fs 1.0
 - 设置 `MAXMIX`（默认 40）
 - 添加 `LASPH = .TRUE.` 和 `ADDGRID = .TRUE.`
 - 支持 INCAR.base 继承
+- **v2.0**：自动检测含 H 体系并调整 POTIM
+- **v2.0**：Langevin gamma 过大时警告
+- **v2.0**：支持两段式 INCAR（平衡/生产）
+
+### 两段式 AIMD（平衡/生产分离）
+
+```bash
+# 生成两段式 INCAR
+python3 make_incar_aimd.py --two_stage
+
+# 1. 平衡段（强控温）
+cp INCAR.eq INCAR
+NP=16 run_vasp.sh
+
+# 2. 切换到生产段
+cp CONTCAR POSCAR
+cp INCAR.prod INCAR
+NP=16 run_vasp.sh
+
+# 3. 扩散分析只用生产段
+python3 aimd_msd.py --specie Li --dt_fs 1.0
+```
+
+> ⚠️ **扩散系数只能用生产段数据**，平衡段 gamma 较大会抑制动力学
 
 ### 生成的 INCAR 关键参数
 
