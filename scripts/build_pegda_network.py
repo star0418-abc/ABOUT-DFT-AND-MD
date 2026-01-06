@@ -113,6 +113,14 @@ REACTIVE_ATOM_NAMES = {
     "tail_b": "TB",  # 第二端的 =CH- 碳
 }
 
+def find_sacrificial_hydrogen(mol: 'Chem.Mol', atom_idx: int) -> Optional[int]:
+    """找到反应位点相邻的牺牲氢 (0-based 索引)"""
+    atom = mol.GetAtomWithIdx(atom_idx)
+    for neighbor in atom.GetNeighbors():
+        if neighbor.GetSymbol() == "H":
+            return neighbor.GetIdx()
+    return None
+
 
 # ==============================================================================
 # EGDA Active Form 生成
@@ -217,6 +225,22 @@ def prepare_egda_active_form(
         if mol_with_h.GetNumConformers() == 0:
             AllChem.EmbedMolecule(mol_with_h, randomSeed=2025)
         
+        # 移除反应位点的牺牲氢，避免交联后出现五价碳
+        sacrificial_h = []
+        for label in ("HA", "TA", "HB", "TB"):
+            atom_idx = reactive_atoms[label] - 1
+            h_idx = find_sacrificial_hydrogen(mol_with_h, atom_idx)
+            if h_idx is None:
+                print(f"[WARN] 未找到 {label} 上的牺牲氢")
+                continue
+            sacrificial_h.append(h_idx)
+
+        if sacrificial_h:
+            rw_with_h = Chem.RWMol(mol_with_h)
+            for h_idx in sorted(set(sacrificial_h), reverse=True):
+                rw_with_h.RemoveAtom(h_idx)
+            mol_with_h = rw_with_h.GetMol()
+
         # UFF 优化
         if UFFHasAllMoleculeParams(mol_with_h):
             UFFOptimizeMolecule(mol_with_h, maxIters=200)
@@ -1100,4 +1124,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-
