@@ -1,9 +1,9 @@
-<<<<<<< HEAD
+
 # ABOUT-DFT-AND-MD
 VASP PACKMOL HTPOLYNET GROMACS AND SOMETHING ELSE
   This repository contains code I developed for molecular simulations. Primarily, it uses VASP to calculate the Density of States (DOS) and work function, while enabling an automated workflow from PACKMOL to HTPOLYNET and subsequently to GROMACS. As my research focuses on gel electrolytes, components should be input in the order of salt + polymer matrix + crosslinker + initiator. After inputting the components sequentially, you can obtain your desired results/outputs directly from GROMACS. Overall, the workflow is relatively user-friendly. The code has undergone multiple revisions and updates, with numerous custom scripts integrated to meet my specific research needs.
   Special thanks to Dr. Lu Tian for his excellent MULTIWFN software. Please feel free to raise any questions or issues if encountered.
-=======
+
 # 凝胶电解质 Packmol 生成器
 
 配方驱动的分子模拟初始结构生成工具，支持：
@@ -91,6 +91,7 @@ bash scripts/run_workflow.sh
 # 显式指定配置文件
 bash scripts/run_workflow.sh -c config/recipe.yaml
 
+ codex/check-for-logic-and-physics-errors-in-generate_topology_gaff
 # 跳过某些阶段
 bash scripts/run_workflow.sh --skip-htpolynet --skip-gromacs
 
@@ -102,6 +103,19 @@ bash scripts/run_workflow.sh --cn-cutoff 0.4 --cn-groups "LI O"
 
 # 合并 Packmol 与 HTPolyNet 结构（需确认拓扑一致）
 bash scripts/run_workflow.sh --allow-merged
+
+# 跳过某些阶段
+bash scripts/run_workflow.sh --skip-htpolynet --skip-gromacs
+
+# 选择力场（GAFF / GAFF2）
+bash scripts/run_workflow.sh --ff gaff2
+
+# 配位数参数
+bash scripts/run_workflow.sh --cn-cutoff 0.4 --cn-groups "LI O"
+
+# 合并 Packmol 与 HTPolyNet 结构（需确认拓扑一致）
+bash scripts/run_workflow.sh --allow-merged
+ MD
 ```
 
 ---
@@ -260,6 +274,7 @@ bash scripts/run_gmx.sh -i outputs/htpolynet/PEGDA -o outputs/gmx
 | `naming.py` | 统一命名规则 |
 | `validate.py` | 文件/物理量校验 |
 | `logging_utils.py` | 统一日志格式 |
+ codex/check-for-logic-and-physics-errors-in-generate_topology_gaff
 | `connectivity.py` | 分子连通性检查 |
 
 ---
@@ -275,6 +290,25 @@ bash scripts/run_gmx.sh -i outputs/htpolynet/PEGDA -o outputs/gmx
 请确保该参数与所用溶剂/聚合物力场兼容，否则可能引入系统性误差。
 
 ## ⚠️ 常见问题 (Troubleshooting)
+
+| `connectivity.py` | 分子连通性检查 |
+
+---
+
+## ⚠️ GAFF2 拓扑生成注意事项
+
+`scripts/generate_topology_gaff.py` 现在**必须**通过 acpype 生成每个分子的完整拓扑（包含 bonds/angles/dihedrals）。
+脚本已移除“简化参数回退”逻辑，acpype 失败将直接报错停止，避免生成错误拓扑。
+
+codex/check-for-logic-and-physics-errors-in-generate_topology_gaff-bb0i9g
+支持通过 `--ff gaff|gaff2` 在 GAFF 与 GAFF2 间切换（默认 gaff2）。
+
+ MD
+此外，脚本内置了 Li+ 的固定参数（GAFF2 并不自带金属离子参数）。
+请确保该参数与所用溶剂/聚合物力场兼容，否则可能引入系统性误差。
+
+## ⚠️ 常见问题 (Troubleshooting)
+ MD
 
 ### 1. 文件找不到 (FileNotFoundError)
 
@@ -450,4 +484,4 @@ MIT License
 ## 贡献
 
 欢迎提交 Issue 和 Pull Request!
->>>>>>> e5c09c9 (init)
+
