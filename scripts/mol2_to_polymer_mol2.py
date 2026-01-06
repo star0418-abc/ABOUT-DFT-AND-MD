@@ -48,7 +48,7 @@ mol2_to_polymer_mol2.py - 从单体 MOL2 生成聚合物寡聚体 MOL2
   MMA → PMMA (聚甲基丙烯酸甲酯) - C=C 加成聚合
   AM → PAM (聚丙烯酰胺) - C=C 加成聚合
 
-版本: 2.1.0
+版本: 2.1.1
 """
 
 import argparse
@@ -95,6 +95,9 @@ except ImportError:
 # 常量与配置
 # ==============================================================================
 
+
+# 版本号
+VERSION = "2.1.1"
 
 # ⚠️ 重要变更: 默认聚合度从 5/20 改为 3 (三聚体)
 DEFAULT_OLIGOMER_N = 3
@@ -719,6 +722,15 @@ def prepare_monomer_for_polymerization(
     return mol.GetMol()
 
 
+def find_sacrificial_hydrogen(mol: Chem.Mol, atom_idx: int) -> Optional[int]:
+    """找到连接原子相邻的牺牲氢 (0-based)"""
+    atom = mol.GetAtomWithIdx(atom_idx)
+    for neighbor in atom.GetNeighbors():
+        if neighbor.GetSymbol() == "H":
+            return neighbor.GetIdx()
+    return None
+
+
 def polymerize_linear_v2(
     monomer: Chem.Mol,
     head_idx: int,
@@ -816,6 +828,26 @@ def polymerize_linear_v2(
             new_head = head_idx + offset
             new_tail = tail_idx + offset
             
+            # 移除连接位点的牺牲氢，避免五价碳
+            tail_h = find_sacrificial_hydrogen(polymer, current_tail)
+            head_h = find_sacrificial_hydrogen(polymer, new_head)
+
+            hydrogens_to_remove = sorted(
+                [h for h in [tail_h, head_h] if h is not None],
+                reverse=True,
+            )
+
+            tail_adjust = sum(1 for h in hydrogens_to_remove if h < current_tail)
+            head_adjust = sum(1 for h in hydrogens_to_remove if h < new_head)
+            new_tail_adjust = sum(1 for h in hydrogens_to_remove if h < new_tail)
+
+            for h_idx in hydrogens_to_remove:
+                polymer.RemoveAtom(h_idx)
+
+            current_tail -= tail_adjust
+            new_head -= head_adjust
+            new_tail -= new_tail_adjust
+
             # 添加连接键
             polymer.AddBond(current_tail, new_head, Chem.BondType.SINGLE)
             
