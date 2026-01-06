@@ -7,7 +7,7 @@
 
 """
 generate_topology_gaff.py - 使用 GAFF2 力场生成 GROMACS 拓扑
-================================================================
+
 为电解质体系生成完整的 GROMACS 拓扑，使用通用 AMBER 力场 (GAFF2)。
 
 策略:
@@ -53,7 +53,13 @@ def parse_recipe(recipe_path: Path) -> dict:
     return molecules
 
 
-def run_acpype_for_mol(mol_pdb: Path, mol_name: str, charge: int, work_dir: Path) -> Optional[Path]:
+def run_acpype_for_mol(
+    mol_pdb: Path,
+    mol_name: str,
+    charge: int,
+    work_dir: Path,
+    force_field: str,
+) -> Optional[Path]:
     """为单个分子运行 acpype"""
     print(f"  [acpype] {mol_name} (charge={charge})...")
     
@@ -69,7 +75,7 @@ def run_acpype_for_mol(mol_pdb: Path, mol_name: str, charge: int, work_dir: Path
         "acpype",
         "-i", str(pdb_copy.resolve()),
         "-n", str(charge),
-        "-a", "gaff2",
+        "-a", force_field,
         "-o", "gmx",
         "-b", mol_name,
     ]
@@ -290,6 +296,14 @@ def main():
     parser.add_argument("-o", "--output")
     parser.add_argument("--box", type=float, default=25.4)
     parser.add_argument("--skip-acpype", action="store_true", help="(已废弃) 不再支持跳过 acpype")
+codex/check-for-logic-and-physics-errors-in-generate_topology_gaff-bb0i9g
+    parser.add_argument(
+        "--ff",
+        choices=["gaff", "gaff2"],
+        default="gaff2",
+        help="acpype 力场类型 (默认: gaff2)",
+    )
+ MD
     
     args = parser.parse_args()
     
@@ -331,7 +345,11 @@ def main():
             return 1
 
         # 使用 acpype 生成参数
+ codex/check-for-logic-and-physics-errors-in-generate_topology_gaff-bb0i9g
+        itp = run_acpype_for_mol(mol_file, mol_name, charge, output_dir, args.ff)
+
         itp = run_acpype_for_mol(mol_file, mol_name, charge, output_dir)
+ MD
 
         if itp and itp.exists():
             content = itp.read_text()
