@@ -416,6 +416,14 @@ salt:
   anion: {file: "molecules/TFSI.pdb", mw_g_mol: 280.13}
 ```
 
+### GROMACS MDP 参数提示（npt_pr.mdp）
+
+- `lincs-order = 4` 为默认值；若在模拟中出现 **LINCS warning**（尤其是聚合链强扭曲位置），
+  可将其提高到 **6 或 8** 以增强约束精度；若无报错则保持 4 以获得更快速度。
+- `gen_vel = no` 与 `continuation = yes` 假设 `npt_pr.tpr` 由
+  `grompp -t npt_ber.cpt`（或更早阶段 checkpoint）生成，并与
+  `em → nvt → npt_ber → npt_pr` 的连续流程一致。
+
 ---
 
 ## 自检验证

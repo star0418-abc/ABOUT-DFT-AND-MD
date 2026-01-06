@@ -89,10 +89,11 @@ continuation    = yes           ; 续算模式
 constraints     = h-bonds
 constraint-algorithm = LINCS
 lincs-iter      = 1
-lincs-order     = 4
+lincs-order     = 4            ; 默认 4，若出现 LINCS warning
+                                ; （如聚合链扭曲较强）可升至 6 或 8
+                                ; 不报错则保持 4 以保证速度
 
 ; ============== 质心运动移除 ==============
 nstcomm         = 100
 comm-mode       = Linear
 comm-grps       = System
-
