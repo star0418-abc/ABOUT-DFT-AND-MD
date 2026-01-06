@@ -1,7 +1,9 @@
+<<<<<<< HEAD
 # ABOUT-DFT-AND-MD
 VASP PACKMOL HTPOLYNET GROMACS AND SOMETHING ELSE
   This repository contains code I developed for molecular simulations. Primarily, it uses VASP to calculate the Density of States (DOS) and work function, while enabling an automated workflow from PACKMOL to HTPOLYNET and subsequently to GROMACS. As my research focuses on gel electrolytes, components should be input in the order of salt + polymer matrix + crosslinker + initiator. After inputting the components sequentially, you can obtain your desired results/outputs directly from GROMACS. Overall, the workflow is relatively user-friendly. The code has undergone multiple revisions and updates, with numerous custom scripts integrated to meet my specific research needs.
   Special thanks to Dr. Lu Tian for his excellent MULTIWFN software. Please feel free to raise any questions or issues if encountered.
+=======
 # 凝胶电解质 Packmol 生成器
 
 配方驱动的分子模拟初始结构生成工具，支持：
@@ -14,7 +16,7 @@ VASP PACKMOL HTPOLYNET GROMACS AND SOMETHING ELSE
 
 ## 目录结构
 
-
+```
 gel_packmol/
 ├── config/                     # ⭐ 配置文件（唯一权威）
 │   └── recipe.yaml            # 统一配置入口
@@ -216,6 +218,9 @@ bash scripts/run_htpolynet.sh --example 0 -o outputs/htpolynet_test
 bash scripts/run_gmx.sh -i outputs/htpolynet/PEGDA -o outputs/gmx
 ```
 
+> ⚙️ 说明：`configs/mdp/npt_pr.mdp` 默认 `lincs-order = 4`。  
+> 若模拟中出现 LINCS warning（尤其在交联/高应力体系），可将其提高到 6 或 8。
+
 ---
 
 ## 📁 scripts/ 目录详解
@@ -334,11 +339,14 @@ grep -c "orientation" format/log/XXX.LOG
 ### 5. 空目录运行
 
 ```
+============================================================
 批量转换汇总
+============================================================
 总数:   0
 成功:   0
 跳过:   0
 失败:   0
+============================================================
 ```
 
 **解释**: 目录中没有匹配的 .log/.LOG 文件，脚本正常退出  
@@ -445,4 +453,4 @@ MIT License
 ## 贡献
 
 欢迎提交 Issue 和 Pull Request!
-
+>>>>>>> e5c09c9 (init)

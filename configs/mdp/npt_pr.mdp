@@ -1,0 +1,63 @@
+; ==============================================================================
+; npt_pr.mdp - NPT Production with Parrinello-Rahman
+; ==============================================================================
+; 用途: 正式采样阶段的 NPT 模拟
+; 来源: gel_packmol smoke pipeline
+; 时长: 1 ns (smoke test，正式模拟建议 10-100 ns)
+;
+; 注意: 此 mdp 使用 Parrinello-Rahman 压力耦合，适合正式采样
+;       在 smoke test 中可选运行
+; ==============================================================================
+
+; 运行控制
+integrator  = md
+dt          = 0.002     ; 时间步长 2 fs
+nsteps      = 500000    ; 1 ns (smoke); 正式模拟可用 5000000+
+
+; 输出控制
+nstxout         = 0
+nstxout-compressed = 5000       ; 压缩轨迹每 10 ps
+nstvout         = 0
+nstfout         = 0
+nstenergy       = 1000
+nstlog          = 1000
+
+; 近邻列表
+cutoff-scheme   = Verlet
+nstlist         = 20
+ns_type         = grid
+pbc             = xyz
+rlist           = 1.2
+
+; 静电
+coulombtype     = PME
+rcoulomb        = 1.2
+fourierspacing  = 0.12
+
+; 范德华
+vdwtype         = Cut-off
+rvdw            = 1.2
+DispCorr        = EnerPres
+
+; 温度耦合
+tcoupl          = V-rescale
+tc-grps         = System
+tau_t           = 0.5           ; 较大时间常数 (采样阶段)
+ref_t           = 300
+
+; 压力耦合 - Parrinello-Rahman (正式采样)
+pcoupl          = Parrinello-Rahman
+pcoupltype      = isotropic
+tau_p           = 2.0           ; 压力耦合时间常数
+ref_p           = 1.0
+compressibility = 4.5e-5
+
+; 初始速度
+gen_vel         = no
+continuation    = yes
+
+; 约束
+constraints     = h-bonds
+constraint-algorithm = LINCS
+; 若出现 LINCS warning（如聚合物/交联网高应力），可提高到 6 或 8
+lincs-order     = 4
