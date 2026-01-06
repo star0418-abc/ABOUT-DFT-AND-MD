@@ -43,7 +43,11 @@ FORCE_RERUN=false
 SKIP_HTPOLYNET=false
 SKIP_GROMACS=false
 SKIP_CN=false
+ALLOW_MERGED=false
 PYTHON="${PYTHON:-python3}"
+FORCE_FIELD="${FF:-gaff2}"
+CN_CUTOFF="0.35"
+CN_GROUPS="LI O"
 
 # MDP 配置 (smoke 或 prod)
 # 可通过环境变量 MDP_PROFILE 或 --mdp-profile 参数设置
@@ -92,12 +96,16 @@ usage() {
   --mdp-profile <name>  MDP 配置集 (smoke|prod，默认: smoke)
                         smoke: configs/mdp/      (快速测试)
                         prod:  config/mdp_prod/  (正式模拟)
+  --ff <gaff|gaff2>      选择 acpype 力场 (默认: gaff2)
   --force               强制重跑所有步骤
   --skip-htpolynet      跳过 HTPolyNet 阶段
   --skip-gromacs        跳过 GROMACS 阶段
   --skip-cn             跳过配位数计算
+  --allow-merged         允许合并 Packmol 与 HTPolyNet 结构
   --keep-big            保留大文件 (traj.xtc 等)
   --dry-run             模拟运行
+  --cn-cutoff <nm>       配位数截断半径 (默认: 0.35 nm)
+  --cn-groups "<A> <B>"  配位数分组名称 (默认: "LI O")
   -h, --help            显示帮助
 
 示例:
@@ -109,6 +117,7 @@ usage() {
 
 环境变量:
   MDP_PROFILE=prod      # 等同于 --mdp-profile prod
+  FF=gaff               # 等同于 --ff gaff
 
 MDP 配置说明:
   smoke (默认):
@@ -155,6 +164,10 @@ parse_args() {
                 MDP_PROFILE="$2"
                 shift 2
                 ;;
+            --ff)
+                FORCE_FIELD="$2"
+                shift 2
+                ;;
             --force)
                 FORCE_RERUN=true
                 shift
@@ -171,6 +184,10 @@ parse_args() {
                 SKIP_CN=true
                 shift
                 ;;
+            --allow-merged)
+                ALLOW_MERGED=true
+                shift
+                ;;
             --keep-big)
                 KEEP_BIG=true
                 shift
@@ -178,6 +195,14 @@ parse_args() {
             --dry-run)
                 DRY_RUN=true
                 shift
+                ;;
+            --cn-cutoff)
+                CN_CUTOFF="$2"
+                shift 2
+                ;;
+            --cn-groups)
+                CN_GROUPS="$2"
+                shift 2
                 ;;
             -h|--help)
                 usage
@@ -203,6 +228,45 @@ parse_args() {
             MDP_DIR="$MDP_DIR_SMOKE"
             ;;
     esac
+
+    case "$FORCE_FIELD" in
+        gaff|gaff2)
+            ;;
+        *)
+            warn "未知力场: $FORCE_FIELD，使用默认 gaff2"
+            FORCE_FIELD="gaff2"
+            ;;
+    esac
+}
+
+# ==============================================================================
+# YAML 读取工具
+# ==============================================================================
+yaml_get() {
+    local yaml_file="$1"
+    local key_path="$2"
+    "$PYTHON" - << PYTHON_SCRIPT 2>/dev/null
+import sys
+try:
+    import yaml
+except Exception:
+    sys.exit(0)
+
+path = "${key_path}".split(".")
+with open("${yaml_file}", "r") as fh:
+    data = yaml.safe_load(fh)
+
+cur = data
+for key in path:
+    if not isinstance(cur, dict) or key not in cur:
+        sys.exit(0)
+    cur = cur[key]
+
+if cur is None:
+    sys.exit(0)
+
+print(cur)
+PYTHON_SCRIPT
 }
 
 # ==============================================================================
@@ -268,7 +332,7 @@ validate_recipe() {
     # 检查必要字段
     local required_fields=("molecules" "system" "packmol")
     for field in "${required_fields[@]}"; do
-        if ! grep -q "^${field}:" "$RECIPE_FILE"; then
+        if [[ -z "$(yaml_get "$RECIPE_FILE" "$field")" ]]; then
             error "配方缺少必要字段: $field"
             exit 1
         fi
@@ -277,7 +341,7 @@ validate_recipe() {
     # 检查配方组分（至少有一个）
     local has_components=false
     for comp in "salt_solution" "polymer_matrix" "crosslinker" "photoinitiator"; do
-        if grep -q "^${comp}:" "$RECIPE_FILE"; then
+        if [[ -n "$(yaml_get "$RECIPE_FILE" "$comp")" ]]; then
             has_components=true
             break
         fi
@@ -340,7 +404,7 @@ run_packmol_phase() {
     cd "$PROJECT_ROOT"
     
     # 检查是否有 salt_solution 格式
-    if grep -q "^salt_solution:" "$RECIPE_FILE"; then
+    if [[ -n "$(yaml_get "$RECIPE_FILE" "salt_solution")" ]]; then
         # 新格式：需要先换算
         info "检测到结构化配方，运行换算..."
         
@@ -401,136 +465,51 @@ run_htpolynet_phase() {
     
     cd "$PROJECT_ROOT"
     
-    # 从 recipe.yaml 读取 HTPolyNet 参数
     local n_monomers
     local conversion
     local seed
-    n_monomers=$(grep -A10 "^htpolynet:" "$RECIPE_FILE" | grep "n_monomers:" | head -1 | awk '{print $2}' || true)
-    conversion=$(grep -A20 "^htpolynet:" "$RECIPE_FILE" | grep "desired_conversion:" | head -1 | awk '{print $2}' || true)
-    seed=$(grep -A20 "^htpolynet:" "$RECIPE_FILE" | grep "random_seed:" | head -1 | awk '{print $2}' || true)
-    
-    # 使用较小的值进行快速演示
-    n_monomers="${n_monomers:-50}"
-    conversion="${conversion:-0.60}"
+    local building_block
+    local workdir
+
+    n_monomers="$(yaml_get "$RECIPE_FILE" "htpolynet.cure.n_monomers")"
+    conversion="$(yaml_get "$RECIPE_FILE" "htpolynet.cure.desired_conversion")"
+    seed="$(yaml_get "$RECIPE_FILE" "htpolynet.cure.random_seed")"
+    building_block="$(yaml_get "$RECIPE_FILE" "htpolynet.building_block.source")"
+    workdir="$(yaml_get "$RECIPE_FILE" "htpolynet.workdir")"
+
+    n_monomers="${n_monomers:-200}"
+    conversion="${conversion:-0.80}"
     seed="${seed:-2025}"
-    
+    building_block="${building_block:-mol/EGDA.mol}"
+    workdir="${workdir:-${RUN_DIR}/htpolynet}"
+    if [[ "$workdir" != /* ]]; then
+        workdir="${PROJECT_ROOT}/${workdir}"
+    fi
+
     info "HTPolyNet 参数: n_monomers=$n_monomers, conversion=$conversion, seed=$seed"
-    
-    # 生成 EGDA active form
-    info "生成 EGDA active form..."
-    
-    local egda_mol="${PROJECT_ROOT}/mol/EGDA.mol"
-    local active_mol2="${htpolynet_dir}/EGDA_active.mol2"
-    
-    if [[ ! -f "$egda_mol" ]]; then
-        error "EGDA 单体文件不存在: $egda_mol"
-        fail "Phase 2 失败"
+
+    info "运行 HTPolyNet 生成交联网络..."
+    if "$PYTHON" "${SCRIPT_DIR}/build_pegda_network.py" \
+        --in_mol "$building_block" \
+        --workdir "$workdir" \
+        --out_mol2 "${RUN_DIR}/htpolynet/PEGDA.mol2" \
+        --n_monomers "$n_monomers" \
+        --conversion "$conversion" \
+        --seed "$seed" 2>&1 | tee -a "$LOG_FILE"; then
+        success "HTPolyNet 运行完成"
+    else
+        fail "HTPolyNet 运行失败"
         return 1
     fi
-    
-    # 使用 Python 生成 active form
-    "$PYTHON" << PYTHON_SCRIPT 2>&1 | tee -a "$LOG_FILE"
-import sys, os
-sys.path.insert(0, '${SCRIPT_DIR}')
 
-from rdkit import Chem
-from rdkit.Chem import AllChem
-from rdkit.Chem.rdForceFieldHelpers import UFFOptimizeMolecule, UFFHasAllMoleculeParams
-from rdkit import RDLogger
-RDLogger.logger().setLevel(RDLogger.ERROR)
-
-egda_mol_path = '${egda_mol}'
-active_mol2_path = '${active_mol2}'
-os.makedirs(os.path.dirname(active_mol2_path), exist_ok=True)
-
-mol = Chem.MolFromMolFile(egda_mol_path, removeHs=False)
-if mol is None:
-    print('ERROR: 无法读取 EGDA.mol')
-    sys.exit(1)
-
-acrylate_pattern = Chem.MolFromSmarts('[CH2:1]=[CH:2]-[C:3](=[O:4])-[O:5]')
-matches = mol.GetSubstructMatches(acrylate_pattern)
-
-if len(matches) < 2:
-    print(f'ERROR: 只找到 {len(matches)} 个丙烯酸酯端基')
-    sys.exit(1)
-
-rw_mol = Chem.RWMol(mol)
-reactive_atoms = {}
-
-for i, match in enumerate(matches[:2]):
-    ch2_idx, ch_idx = match[0], match[1]
-    bond = rw_mol.GetBondBetweenAtoms(ch2_idx, ch_idx)
-    if bond and bond.GetBondType() == Chem.BondType.DOUBLE:
-        bond.SetBondType(Chem.BondType.SINGLE)
-    if i == 0:
-        reactive_atoms['HA'] = ch2_idx
-        reactive_atoms['TA'] = ch_idx
-    else:
-        reactive_atoms['HB'] = ch2_idx
-        reactive_atoms['TB'] = ch_idx
-
-mol_no_h = Chem.RemoveHs(rw_mol)
-mol_with_h = Chem.AddHs(mol_no_h, addCoords=True)
-if mol_with_h.GetNumConformers() == 0:
-    AllChem.EmbedMolecule(mol_with_h, randomSeed=2025)
-if UFFHasAllMoleculeParams(mol_with_h):
-    UFFOptimizeMolecule(mol_with_h, maxIters=200)
-
-# 写入 MOL2
-conf = mol_with_h.GetConformer()
-atoms = list(mol_with_h.GetAtoms())
-bonds = list(mol_with_h.GetBonds())
-
-reactive_idx_to_name = {v: k for k, v in reactive_atoms.items()}
-atom_names = {}
-element_count = {}
-
-for atom in atoms:
-    idx = atom.GetIdx()
-    if idx in reactive_idx_to_name:
-        atom_names[idx] = reactive_idx_to_name[idx]
-    else:
-        symbol = atom.GetSymbol()
-        element_count[symbol] = element_count.get(symbol, 0) + 1
-        atom_names[idx] = f'{symbol}{element_count[symbol]}'
-
-with open(active_mol2_path, 'w') as f:
-    f.write('@<TRIPOS>MOLECULE\nEGDA\n')
-    f.write(f' {len(atoms)} {len(bonds)} 1 0 0\nSMALL\nNO_CHARGES\n\n')
-    f.write('@<TRIPOS>ATOM\n')
-    for atom in atoms:
-        idx = atom.GetIdx()
-        pos = conf.GetAtomPosition(idx)
-        symbol = atom.GetSymbol()
-        sybyl = 'H' if symbol == 'H' else f'{symbol}.3'
-        f.write(f'{idx+1:7d} {atom_names[idx]:<4s} {pos.x:10.4f} {pos.y:10.4f} {pos.z:10.4f} {sybyl:<6s} 1 EGD  0.0000\n')
-    f.write('@<TRIPOS>BOND\n')
-    for i, bond in enumerate(bonds):
-        f.write(f'{i+1:6d} {bond.GetBeginAtomIdx()+1:5d} {bond.GetEndAtomIdx()+1:5d} 1\n')
-    f.write('@<TRIPOS>SUBSTRUCTURE\n     1 EGD         1 RESIDUE    0 **** **** 0 ROOT\n')
-
-print(f'Active form 已生成: {active_mol2_path}')
-
-# 转换为 PDB
-mol2 = Chem.MolFromMol2File(active_mol2_path, removeHs=False)
-if mol2:
-    Chem.MolToPDBFile(mol2, '${network_pdb}')
-    print(f'network.pdb 已生成: ${network_pdb}')
-PYTHON_SCRIPT
-    
-    if [[ -f "$network_pdb" ]]; then
+    local candidate_pdb
+    candidate_pdb=$(ls "$workdir"/pegda_network_final.pdb "$workdir"/pegda_network.pdb "$workdir"/*.pdb 2>/dev/null | head -1 || true)
+    if [[ -n "$candidate_pdb" && -f "$candidate_pdb" ]]; then
+        cp "$candidate_pdb" "$network_pdb"
         success "Phase 2 完成: 交联网络已生成"
     else
-        warn "HTPolyNet 生成简化网络"
-        # 创建简化网络
-        if [[ -f "$active_mol2" ]]; then
-            "$PYTHON" -c "
-from rdkit import Chem
-mol = Chem.MolFromMol2File('$active_mol2', removeHs=False)
-if mol: Chem.MolToPDBFile(mol, '$network_pdb')
-" 2>/dev/null || true
-        fi
+        fail "未找到 HTPolyNet 输出 PDB"
+        return 1
     fi
 }
 
@@ -557,9 +536,14 @@ run_gromacs_phase() {
 
     # 选择输入结构（若两者存在则合并）
     if [[ -f "$packmol_pdb" ]] && [[ -f "$network_pdb" ]]; then
+        if [[ "$ALLOW_MERGED" != "true" ]]; then
+            warn "检测到 Packmol + HTPolyNet 输出，但未允许合并。"
+            warn "交联网络与配方单体拓扑不一致时会导致 grompp 失败。"
+            warn "如需合并，请使用 --allow-merged 并确保拓扑一致。"
+            return 0
+        fi
         info "检测到 Packmol + HTPolyNet，合并结构..."
         "$PYTHON" << PYTHON_SCRIPT 2>&1 | tee -a "$LOG_FILE"
-import itertools
 from pathlib import Path
 
 packmol = Path("${packmol_pdb}")
@@ -603,11 +587,12 @@ PYTHON_SCRIPT
     info "使用输入结构: $input_pdb"
     cp "$input_pdb" "$topology_input"
 
-    info "生成 GAFF2 拓扑..."
-    if ! "$PYTHON" "${SCRIPT_DIR}/generate_topology.py" \
+    info "生成 ${FORCE_FIELD} 拓扑..."
+    if ! "$PYTHON" "${SCRIPT_DIR}/generate_topology_gaff.py" \
         -i "$gmx_dir" \
         -c "$RECIPE_FILE" \
-        -o "$gmx_dir" 2>&1 | tee -a "$LOG_FILE"; then
+        -o "$gmx_dir" \
+        --ff "$FORCE_FIELD" 2>&1 | tee -a "$LOG_FILE"; then
         warn "拓扑生成失败，跳过 GROMACS"
         return 0
     fi
@@ -702,28 +687,41 @@ run_coordination_phase() {
     fi
 
     if [[ ! -f "${gmx_dir}/index.ndx" ]]; then
- codex/check-scripts/run_workflow.sh-zg1dqw
         warn "未找到 index.ndx，尝试自动生成..."
         if ! command -v gmx &>/dev/null; then
             warn "gmx 不可用，无法生成 index.ndx"
             return 0
         fi
-        if echo -e "r LI\nr O\nq\n" | gmx make_ndx -f "$tpr_file" -o "${gmx_dir}/index.ndx" 2>&1 | tee -a "$LOG_FILE"; then
-            info "已生成 index.ndx"
-        else
-            warn "自动生成 index.ndx 失败，请手动创建包含 LI 与 O 组的索引文件"
+        local groups=()
+        read -r -a groups <<< "$CN_GROUPS"
+        if [[ "${#groups[@]}" -ne 2 ]]; then
+            warn "CN 分组格式无效，请使用 \"A B\"（组名含空格请改用无空格名称）"
             return 0
         fi
-
-        warn "未找到 index.ndx，请先生成包含 LI 与 O 组的索引文件"
-        return 0
-cursor-sync
+        local group_a="${groups[0]}"
+        local group_b="${groups[1]}"
+        if echo -e "r ${group_a}\nr ${group_b}\nq\n" | gmx make_ndx -f "$tpr_file" -o "${gmx_dir}/index.ndx" 2>&1 | tee -a "$LOG_FILE"; then
+            info "已生成 index.ndx"
+        else
+            warn "自动生成 index.ndx 失败，请手动创建包含 ${group_a} 与 ${group_b} 组的索引文件"
+            return 0
+        fi
     fi
 
     info "使用 gmx rdf 计算配位数..."
-    if echo -e "LI\nO\n" | gmx rdf -f "$traj_file" -s "$tpr_file" -n "${gmx_dir}/index.ndx" -o rdf_Li_O.xvg -cn cn_Li_O.xvg 2>&1 | tee -a "$LOG_FILE"; then
+    local groups=()
+    read -r -a groups <<< "$CN_GROUPS"
+    if [[ "${#groups[@]}" -ne 2 ]]; then
+        warn "CN 分组格式无效，请使用 \"A B\"（组名含空格请改用无空格名称）"
+        return 0
+    fi
+    local group_a="${groups[0]}"
+    local group_b="${groups[1]}"
+    local group_tag
+    group_tag="$(printf "%s_%s" "$group_a" "$group_b" | tr -c 'A-Za-z0-9_-' '_')"
+    if echo -e "${group_a}\n${group_b}\n" | gmx rdf -f "$traj_file" -s "$tpr_file" -n "${gmx_dir}/index.ndx" -o "rdf_${group_tag}.xvg" -cn "cn_${group_tag}.xvg" 2>&1 | tee -a "$LOG_FILE"; then
         local cn_value
-        cn_value=$(awk '($1>=0.35){print $2; exit}' cn_Li_O.xvg 2>/dev/null || true)
+        cn_value=$(awk -v cutoff="$CN_CUTOFF" '($1>=cutoff){print $2; exit}' "cn_${group_tag}.xvg" 2>/dev/null || true)
         cat > coordination_summary.txt << EOF
 # ============================================
 # 配位数分析结果
@@ -734,18 +732,18 @@ timestamp: $(date)
 run_dir: ${RUN_DIR}
 recipe: ${RECIPE_FILE}
 
-# Li-O 配位数
-CN(Li-O) at r=0.35 nm: ${cn_value:-N/A}
+# ${group_a}-${group_b} 配位数
+CN(${group_a}-${group_b}) at r=${CN_CUTOFF} nm: ${cn_value:-N/A}
 
 # 说明
 note: 使用 gmx rdf -cn 计算
 
 # 文件
 files:
-  - rdf_Li_O.xvg
-  - cn_Li_O.xvg
+  - rdf_${group_tag}.xvg
+  - cn_${group_tag}.xvg
 EOF
-        success "Phase 4 完成: CN(Li-O)@0.35nm = ${cn_value:-N/A}"
+        success "Phase 4 完成: CN(${group_a}-${group_b})@${CN_CUTOFF}nm = ${cn_value:-N/A}"
     else
         warn "gmx rdf 失败，跳过配位数结果输出"
         return 0
@@ -806,7 +804,7 @@ print_summary() {
     
     if [[ -f "${RUN_DIR}/analysis/coordination/coordination_summary.txt" ]]; then
         echo "配位数:"
-        grep "CN(Li-O)" "${RUN_DIR}/analysis/coordination/coordination_summary.txt" 2>/dev/null || true
+        grep "CN(" "${RUN_DIR}/analysis/coordination/coordination_summary.txt" 2>/dev/null || true
     fi
     echo ""
     
