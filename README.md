@@ -252,6 +252,14 @@ bash scripts/run_gmx.sh -i outputs/htpolynet/PEGDA -o outputs/gmx
 
 ---
 
+## ⚠️ GAFF2 拓扑生成注意事项
+
+`scripts/generate_topology_gaff.py` 现在**必须**通过 acpype 生成每个分子的完整拓扑（包含 bonds/angles/dihedrals）。
+脚本已移除“简化参数回退”逻辑，acpype 失败将直接报错停止，避免生成错误拓扑。
+
+此外，脚本内置了 Li+ 的固定参数（GAFF2 并不自带金属离子参数）。
+请确保该参数与所用溶剂/聚合物力场兼容，否则可能引入系统性误差。
+
 ## ⚠️ 常见问题 (Troubleshooting)
 
 ### 1. 文件找不到 (FileNotFoundError)
